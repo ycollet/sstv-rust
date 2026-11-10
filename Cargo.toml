@@ -1,0 +1,28 @@
+[package]
+name = "sstv-jack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Still-image SSTV transmission and progressive reception over JACK"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+jack = "0.14"
+minifb = "0.29"
+rtrb = "0.4"
+sstv = { version = "0.3.1", features = ["image"] }
+
+[[bin]]
+name = "sstv-encoder"
+path = "src/bin/encoder.rs"
+
+[[bin]]
+name = "sstv-decoder"
+path = "src/bin/decoder.rs"
+
+[profile.test]
+opt-level = 1
