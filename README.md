@@ -11,6 +11,9 @@ by default). The receiver
 detects the SSTV mode from its header and displays decoded rows progressively.
 It keeps listening after each image. No radio hardware is required.
 
+See [PROTOCOLS.md](PROTOCOLS.md) for all supported modes, technical signal
+formats, timings, resolutions, and advice on applying effects.
+
 This is actual SSTV timing, not video-rate playback: Robot 36 takes about
 38 seconds per image including its header, followed by two seconds of silence.
 Images are resized to the mode's resolution, which can change their aspect ratio.
