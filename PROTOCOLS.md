@@ -1,4 +1,4 @@
-# Supported SSTV protocols
+# Supported SSTV and NBTV protocols
 
 This document describes the 18 analog color SSTV modes supported by the
 encoder and decoder through `sstv` 0.3.1, the version in `Cargo.lock`.
@@ -10,10 +10,11 @@ automatically identifies it from the VIS header; it has no manual mode selector.
 Every mode transmits a still image, not a conventional moving-video stream.
 
 For moving video, the separate `nbtv-encoder` and `nbtv-decoder` applications
-implement monochrome NBTV Club 32-line at 12.5 fps, not an SSTV mode.
-See [NBTV operation and signal format](README.md#nbtv-moving-video-and-still-images).
+implement Classic and custom Separate sync NBTV. These are not SSTV modes.
+See [NBTV protocols](#nbtv-protocols) below for their signal formats and
+[NBTV operation](README.md#nbtv-moving-video-and-still-images) for application usage.
 
-## Common signal format
+## Common SSTV signal format
 
 SSTV represents image component values as the instantaneous frequency of a
 mono audio signal. During image scans:
@@ -83,7 +84,7 @@ one playback / repeat cycle = header + image body + 2.000 s silence
 For Robot 36 this is approximately **39.710 s**; for PD-120, **129.813 s**.
 Mode names are conventional labels, not exact transmission durations.
 
-## Mode reference
+## SSTV mode reference
 
 The CLI accepts the identifiers below case-insensitively and ignores punctuation
 and spaces: `--protocol PD-120` is equivalent to `--protocol Pd120`.
@@ -278,7 +279,7 @@ The mode number is not an exact time: PD-120 takes about 126.103 seconds for
 image data, and PD-180 about 187.052 seconds. PD-290's larger dimensions explain
 why its total time is longer than PD-240 despite its shorter component scans.
 
-## Choosing a mode and applying effects
+## Choosing an SSTV mode and applying effects
 
 Use **Robot 36** for short turnaround, **Martin 2** for relatively quick
 independent RGB scans, and **PD-120** for higher-resolution experiments without
@@ -314,6 +315,124 @@ frequency estimation. Progressive display is not instantaneous: complete
 components or row pairs and some decoder lookahead are needed before rows can
 be shown.
 
+## NBTV protocols
+
+NBTV sends a continuous low-resolution moving picture, rather than one long
+SSTV still-image transmission. Brightness is encoded directly as signal
+**amplitude**, not as a 1500-2300 Hz tone frequency. The two NBTV modes share
+the same raster but carry synchronization differently.
+
+| GUI mode | CLI identifier | Picture port | Sync source | Compatibility |
+| --- | --- | --- | --- | --- |
+| Classic (embedded sync), default | `--mode classic` | `output` -> `input`, picture and sync together | Negative pulses in the picture signal | NBTV Association club format |
+| Separate sync (custom) | `--mode separate-sync` | `output` -> `input`, picture with sync intervals replaced by black | Independent `sync` -> `sync` connection | Application-specific two-channel format |
+
+Select the same mode in both applications. There is **no VIS header, mode
+identifier, or automatic mode negotiation**. The `sync` ports always exist;
+the encoder leaves its sync output silent in Classic mode.
+
+### Shared raster, levels, and timing
+
+| Parameter | Implemented value |
+| --- | --- |
+| Raster | 32 columns x 48 grayscale samples, portrait 2:3 |
+| Scan direction | Vertical scans bottom to top; columns right to left |
+| Frame rate / duration | 12.5 fps / 80 ms |
+| Line rate / duration | 400 vertical scans per second / 2.5 ms |
+| Sync pulse | 200 microseconds at -0.32 |
+| Black / white | 0.0 / +0.8 |
+| Back / front black porch | 50 microseconds each |
+| Active picture per scan | 2.2 ms |
+| JACK sample rate | At least 32 kHz; 44.1/48 kHz are suitable |
+
+Levels are JACK floating-point signal units, not analog voltages. The sync
+excursion is 40% of the black-to-white range. Active picture samples are linearly
+interpolated from the source raster; the decoder samples within each active
+scan and clamps reconstructed brightness to 0-255.
+
+A normal line has this layout:
+
+```text
+0.200 ms sync -> 0.050 ms black -> 2.200 ms picture -> 0.050 ms black
+```
+
+In the first scan of each frame, the sync interval is black instead of negative.
+This omits the pulse between line 32 and line 1. There are **31 pulses per
+frame**, with a **5 ms gap** between pulse starts across the frame boundary,
+instead of the usual 2.5 ms. The implementation does not use a broad frame pulse.
+
+Timing follows JACK's sample clock without rounding each line to a fixed
+integer sample count: at 44.1 kHz, a line spans 110.25 samples on average.
+Source videos are converted to 12.5 fps and fitted into the 32 x 48 raster with
+black padding; source audio is omitted. A still image becomes a two-second clip.
+Repeat loops the clip without SSTV's trailing two-second silence.
+
+### Classic: embedded missing-pulse synchronization
+
+Classic carries picture and synchronization on one mono JACK connection.
+The decoder identifies negative pulses using **Sync threshold**
+(`--threshold`, default `-0.12`). Picture and black must remain above this
+threshold, while sync must fall below it.
+
+The receiver qualifies pulse widths of 80-400 microseconds. It accepts pulse
+spacing within 0.85-1.15 line periods for ordinary lines, or 1.85-2.15 periods
+for the missing-pulse frame boundary. It reconstructs the omitted-sync scan
+from buffered picture history. A gap longer than three line periods without a
+valid pulse loses lock; acquisition continues automatically.
+
+Initial acquisition and completion normally take roughly two frames (160 ms),
+not including JACK buffering or effects latency. The first and last source
+frames may not be displayed. **Reset** clears reception and queued input.
+
+Gain, clipping, offset, filtering, and echoes alter both brightness and sync.
+Unlike SSTV, there is no initial two-second header that can be protected:
+synchronization must survive throughout the video.
+
+### Separate sync: custom two-channel transport
+
+Separate sync preserves Classic's raster and missing-pulse timing but removes
+negative sync pulses from the picture output, replacing them with black.
+The independent sync output is -0.32 during each pulse and zero otherwise;
+it contains no picture information. Both outputs use the same playback clock,
+including on Repeat and transport restart.
+
+```text
+nbtv-encoder:output -> [picture effects] -> nbtv-decoder:input
+nbtv-encoder:sync   --------------------> nbtv-decoder:sync
+```
+
+The receiver measures pulse timing and threshold crossings only on the sync
+input, and reads brightness only from the picture input. Strong picture
+distortion, including values below the sync threshold, therefore need not
+break synchronization. It can still destroy picture detail, and damage to the
+sync path still causes loss of lock.
+
+The decoder's **Sync delay** (`--sync-delay-ms`, default 0) delays the clean
+sync by **0-2000 ms**, rounded to the nearest audio sample. Use it to match
+latency introduced by picture effects: a purely delayed picture path of 25 ms
+needs 25 ms of sync delay. This cannot align several dry/wet echoes at once or
+track a varying delay. The control is ignored in Classic mode; changing decoder
+mode or delay resets reception and clears queued input and delay history.
+
+This is an application-specific routing format, **not an additional NBTV
+Association standard**. It does not increase resolution, add color, or provide
+error correction, and an ordinary composite NBTV receiver cannot use the two
+channels without adapting their signal handling.
+
+### NBTV bandwidth and interoperability
+
+A path preserving approximately **2 Hz-10 kHz** is a useful starting point.
+NBTV's brightness signal contains important low-frequency information;
+AC-coupled audio paths and high-pass filters can shift black level or distort
+large bright/dark regions. There is no automatic gain control, DC restoration,
+or polarity detection. MP3 and similar lossy audio codecs are not transparent
+transports for this signal.
+
+Classic follows the club's scan geometry and missing-pulse convention, but
+external hardware interoperability has not been verified. Other raster sizes,
+color NBTV, and broad-frame-pulse variants are not implemented. Separate sync
+is intended for controlled JACK effects experiments with these applications.
+
 ## References and implementation scope
 
 - [sstv 0.3.1 mode tables](https://github.com/unexcellent/sstv/tree/v0.3.1/src/modes):
@@ -326,6 +445,10 @@ be shown.
   Specifications*, Dayton SSTV forum, 20 May 2000.
 - [Application operation and JACK routing](README.md), including transport,
   repeat, and headless behavior.
+- [NBTV Association club standard](https://www.nbtv.org.uk/standards.htm):
+  scan geometry, missing-pulse synchronization, levels, and bandwidth.
+- [NBTV codec](src/nbtv.rs) and [paired playback](src/lib.rs): implemented
+  raster timing, receiver tolerances, and custom separate-sync generation.
 
 Other SSTV families, grayscale modes, digital SSTV, and arbitrary custom timings
 are outside this application's current supported set.
