@@ -1,6 +1,7 @@
 //! NBTV Association club format: vertical 32-line monochrome, 12.5 frames/s.
 
 pub mod media;
+pub mod saving;
 
 use std::collections::VecDeque;
 
@@ -95,34 +96,49 @@ impl Clip {
     }
 
     pub fn samples(&self, sample_rate: u32) -> usize {
-        // Ceil the total duration, not individual frame/line durations:
-        // 44.1 kHz has 110.25 samples per line.
-        (self.frames() as u64 * u64::from(sample_rate) * 2).div_ceil(25) as usize
+        frame_samples(self.frames(), sample_rate)
     }
 
     pub fn sample(&self, position: usize, sample_rate: u32) -> f32 {
-        let line_position = position as f64 * LINE_RATE / f64::from(sample_rate);
-        let line_index = line_position.floor() as usize;
-        let column = line_index % WIDTH;
-        let phase = line_position.fract() / LINE_RATE;
-        // The omitted pulse is the boundary between line 32 and line 1.
-        if phase < SYNC_SECONDS {
-            return if column == 0 { 0.0 } else { SYNC_LEVEL };
-        }
-        let active_start = SYNC_SECONDS + PORCH_SECONDS;
-        let active_end = 1.0 / LINE_RATE - PORCH_SECONDS;
-        if phase < active_start || phase >= active_end {
-            return 0.0;
-        }
-        let frame = (line_index / WIDTH).min(self.frames() - 1);
-        let y = (1.0 - (phase - active_start) / (active_end - active_start)) * (HEIGHT - 1) as f64;
-        let y0 = y.floor() as usize;
-        let y1 = (y0 + 1).min(HEIGHT - 1);
-        let x = WIDTH - 1 - column;
-        let a = f32::from(self.pixels[frame * FRAME_PIXELS + y0 * WIDTH + x]);
-        let b = f32::from(self.pixels[frame * FRAME_PIXELS + y1 * WIDTH + x]);
-        (a + (b - a) * y.fract() as f32) / 255.0 * WHITE_LEVEL
+        let frame = frame_index(position, sample_rate).min(self.frames() - 1);
+        sample_frame(
+            &self.pixels[frame * FRAME_PIXELS..(frame + 1) * FRAME_PIXELS],
+            position,
+            sample_rate,
+        )
     }
+}
+
+pub(crate) fn frame_samples(frames: usize, sample_rate: u32) -> usize {
+    // Ceil the total duration, not individual line durations (110.25 samples at 44.1 kHz).
+    (frames as u64 * u64::from(sample_rate) * 2).div_ceil(25) as usize
+}
+
+pub(crate) fn frame_index(position: usize, sample_rate: u32) -> usize {
+    (position as f64 * LINE_RATE / f64::from(sample_rate)).floor() as usize / WIDTH
+}
+
+pub(crate) fn sample_frame(pixels: &[u8], position: usize, sample_rate: u32) -> f32 {
+    let line_position = position as f64 * LINE_RATE / f64::from(sample_rate);
+    let line_index = line_position.floor() as usize;
+    let column = line_index % WIDTH;
+    let phase = line_position.fract() / LINE_RATE;
+    // The omitted pulse is the boundary between line 32 and line 1.
+    if phase < SYNC_SECONDS {
+        return if column == 0 { 0.0 } else { SYNC_LEVEL };
+    }
+    let active_start = SYNC_SECONDS + PORCH_SECONDS;
+    let active_end = 1.0 / LINE_RATE - PORCH_SECONDS;
+    if phase < active_start || phase >= active_end {
+        return 0.0;
+    }
+    let y = (1.0 - (phase - active_start) / (active_end - active_start)) * (HEIGHT - 1) as f64;
+    let y0 = y.floor() as usize;
+    let y1 = (y0 + 1).min(HEIGHT - 1);
+    let x = WIDTH - 1 - column;
+    let a = f32::from(pixels[y0 * WIDTH + x]);
+    let b = f32::from(pixels[y1 * WIDTH + x]);
+    (a + (b - a) * y.fract() as f32) / 255.0 * WHITE_LEVEL
 }
 
 /// A sync-edge receiver. A double line interval identifies the missing pulse.

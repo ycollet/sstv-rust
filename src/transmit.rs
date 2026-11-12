@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use anyhow::{Result, bail};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::Playback;
@@ -18,10 +19,30 @@ pub struct Controls {
     pub length: AtomicUsize,
     pub rolling: AtomicBool,
     pub transport_failed: AtomicBool,
+    pub cache_failed: AtomicBool,
+    underruns: AtomicUsize,
 }
 
 #[allow(deprecated, reason = "fetch_update supports the Rust 1.88 MSRV")]
 impl Controls {
+    pub fn underruns(&self) -> usize {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn check_playback(&self, last_underruns: &mut usize) -> Result<()> {
+        let underruns = self.underruns();
+        if underruns != *last_underruns {
+            eprintln!(
+                "Warning: playback cache underrun; {underruns} samples replaced with silence. Storage read-ahead could not keep up."
+            );
+            *last_underruns = underruns;
+        }
+        if self.cache_failed.load(Ordering::Acquire) {
+            bail!("Playback cache worker failed; see stderr for details");
+        }
+        Ok(())
+    }
+
     pub fn play(&self) {
         self.command
             .fetch_update(Ordering::Release, Ordering::Relaxed, |previous| {
@@ -113,6 +134,7 @@ impl Transmitter {
             self.playing = false;
             loaded = true;
             self.controls.ready.store(true, Ordering::Release);
+            self.controls.cache_failed.store(false, Ordering::Release);
         }
 
         let following = self.controls.follow_transport.load(Ordering::Acquire);
@@ -145,8 +167,14 @@ impl Transmitter {
             sync.fill(0.0);
         }
         if let Some(playback) = &mut self.playback {
+            if playback.failed() {
+                self.playing = false;
+                self.controls.ready.store(false, Ordering::Release);
+                self.controls.cache_failed.store(true, Ordering::Release);
+            }
             playback.set_repeat(self.controls.repeat.load(Ordering::Relaxed));
             if self.playing {
+                let underruns_before = playback.underruns();
                 let finished = if let Some(sync) = sync {
                     playback.fill_with_sync(output, sync, separate)
                 } else {
@@ -155,6 +183,9 @@ impl Transmitter {
                 if finished {
                     self.playing = false;
                 }
+                self.controls
+                    .underruns
+                    .fetch_add(playback.underruns() - underruns_before, Ordering::Relaxed);
             }
             self.controls
                 .position

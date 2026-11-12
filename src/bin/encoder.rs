@@ -1,11 +1,12 @@
 #[path = "encoder/gui.rs"]
 mod gui;
 
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use sstv::{Encoder, Synthesizer, modes};
 use sstv_jack::{
@@ -56,15 +57,46 @@ fn parse_protocol(name: &str) -> std::result::Result<usize, String> {
         })
 }
 
-fn encode(image: &image::DynamicImage, protocol: usize, sample_rate: u32) -> Result<Playback> {
+fn encode(
+    image: &image::DynamicImage,
+    protocol: usize,
+    sample_rate: u32,
+    state: &RunState,
+) -> Result<Playback> {
+    ensure!(state.is_running(), "Image encoding cancelled");
     let encoder =
         Encoder::from_image(modes::ALL[protocol], image).context("Cannot encode image")?;
-    let mut samples: Vec<f32> = Synthesizer::new(encoder, sample_rate)
-        .map(|sample| f32::from(sample) / f32::from(i16::MAX) * 0.8)
-        .collect();
+    let file = tempfile::tempfile().context("Cannot create temporary SSTV cache")?;
+    let mut writer = BufWriter::new(file);
+    let mut buffer = [0; 16_384];
+    let mut used = 0;
+    let mut length = 0;
     // Silence lets a receiver finish its lookahead and separates repeats.
-    samples.resize(samples.len() + 2 * sample_rate as usize, 0.0);
-    Ok(Playback::new(samples, false))
+    for sample in Synthesizer::new(encoder, sample_rate)
+        .chain(std::iter::repeat_n(0, 2 * sample_rate as usize))
+    {
+        let value = f32::from(sample) / f32::from(i16::MAX) * 0.8;
+        buffer[used..used + 4].copy_from_slice(&value.to_le_bytes());
+        used += 4;
+        length += 1;
+        if used == buffer.len() {
+            ensure!(state.is_running(), "Image encoding cancelled");
+            writer
+                .write_all(&buffer)
+                .context("Cannot write SSTV cache")?;
+            used = 0;
+        }
+    }
+    ensure!(state.is_running(), "Image encoding cancelled");
+    writer
+        .write_all(&buffer[..used])
+        .context("Cannot write SSTV cache")?;
+    writer.flush().context("Cannot flush SSTV cache")?;
+    Playback::cached_pcm(
+        writer.into_inner().context("Cannot finish SSTV cache")?,
+        length,
+        sample_rate,
+    )
 }
 
 fn main() -> Result<()> {
@@ -88,7 +120,7 @@ fn main() -> Result<()> {
     if args.headless {
         exchange
             .pending
-            .push(encode(&image, args.protocol, sample_rate)?)
+            .push(encode(&image, args.protocol, sample_rate, &state)?)
             .map_err(|_| anyhow::anyhow!("Audio preparation queue is full"))?;
     }
 
@@ -133,9 +165,11 @@ fn main() -> Result<()> {
         let mut started = false;
         let mut seen_playing = false;
         let mut last_xruns = 0;
+        let mut last_underruns = 0;
         eprintln!("Waiting for a connection or JACK transport. Ctrl-C to exit.");
         (|| -> Result<()> {
             while state.is_running() {
+                controls.check_playback(&mut last_underruns)?;
                 if !args.follow_transport
                     && !started
                     && controls.ready.load(Ordering::Acquire)
@@ -177,6 +211,7 @@ fn main() -> Result<()> {
     if controls.transport_failed.load(Ordering::Relaxed) {
         bail!("Cannot query JACK transport");
     }
+    controls.check_playback(&mut 0)?;
     result?;
     deactivation?;
     Ok(())
@@ -207,8 +242,8 @@ mod tests {
         let image = image::DynamicImage::new_rgb8(32, 24);
         for protocol in ["Robot36", "Martin2"] {
             let protocol = parse_protocol(protocol).unwrap();
-            let mut playback = encode(&image, protocol, 48_000).unwrap();
-            let mut samples = vec![0.0; playback.len()];
+            let mut playback = encode(&image, protocol, 48_000, &RunState::new()).unwrap();
+            let mut samples = vec![0.0; 96_000];
             playback.fill(&mut samples);
             let rows = sstv::Decoder::new(samples.into_iter().map(sstv_jack::pcm_sample), 48_000)
                 .rows()
@@ -218,5 +253,18 @@ mod tests {
                 format!("{:?}", modes::ALL[protocol])
             );
         }
+    }
+
+    #[test]
+    fn preparation_can_be_cancelled_before_synthesis() {
+        let state = RunState::new();
+        state.stop();
+        let image = image::DynamicImage::new_rgb8(32, 24);
+        assert!(
+            encode(&image, 0, 48_000, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
     }
 }

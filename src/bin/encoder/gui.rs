@@ -25,6 +25,7 @@ pub(super) struct EncoderApp {
     waiting_for_audio: bool,
     error: Option<String>,
     xruns: usize,
+    underruns: usize,
 }
 
 impl EncoderApp {
@@ -50,6 +51,7 @@ impl EncoderApp {
             waiting_for_audio: false,
             error: None,
             xruns: 0,
+            underruns: 0,
         };
         app.prepare();
         app
@@ -62,12 +64,19 @@ impl EncoderApp {
         let image = Arc::clone(&self.image);
         let protocol = self.protocol;
         let sample_rate = self.sample_rate;
+        let state = Arc::clone(&self.state);
         self.preparing = Some(std::thread::spawn(move || {
-            encode(&image, protocol, sample_rate)
+            encode(&image, protocol, sample_rate, &state)
         }));
     }
 
     fn poll(&mut self) {
+        if let Err(error) = self.controls.check_playback(&mut self.underruns)
+            && self.error.is_none()
+        {
+            eprintln!("{error:#}");
+            self.error = Some(format!("{error:#}"));
+        }
         // Returning audio here, rather than freeing it in JACK's callback,
         // keeps protocol switches real-time safe.
         while let Ok(previous) = self.exchange.retired.pop() {
@@ -171,6 +180,7 @@ impl eframe::App for EncoderApp {
                 }
                 if ui.add_enabled(playing, egui::Button::new("Stop")).clicked() {
                     self.controls.stop();
+                    self.state.stop();
                 }
             });
             if let Some(error) = &self.error {

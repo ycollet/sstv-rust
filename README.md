@@ -70,9 +70,12 @@ very low-resolution video, not a way to send full-resolution MP4 over audio.
 
 FFmpeg must be available on `PATH` for MP4 and other video formats. PNG/JPEG
 does not require FFmpeg. Media is loaded and resized before playback; the GUI
-remains responsive while its worker prepares it. Resized video is held in RAM
-(approximately 19.2 kB per second, or 69 MB per hour), rather than precomputing a
-much larger audio recording. Loading long/high-resolution files may take time.
+remains responsive while its worker prepares it. Resized video is written to an
+automatically cleaned temporary disk cache (approximately 19.2 kB per second,
+or 69 MB per hour). Playback keeps only a bounded prefix and read-ahead window
+in RAM, rather than the entire video or a much larger audio recording.
+Loading long/high-resolution files may take time. Closing the window or pressing
+Ctrl-C cancels loading, including when FFmpeg is stalled waiting to produce data.
 Playback then runs at JACK's audio clock, not the media loader's speed.
 
 The encoder also supports `--headless`, `--repeat`, `--follow-transport`,
@@ -85,8 +88,11 @@ frame synchronization continuously, including after signal loss;
 Initial acquisition normally needs roughly two frames (160 ms); this is not a
 guaranteed end-to-end latency. The first and last source frames may not be
 displayed while acquiring sync or waiting for the next boundary.
-`--output latest.png` saves each completed frame, overwriting that path at video
-rate. Esc, Ctrl-C, or closing the window exits.
+`--output latest.png` saves completed frames on a separate worker, overwriting
+that path at up to video rate. If saving cannot keep up, only the newest pending
+frame is kept, and skipped saves are reported on stderr; reception does not wait
+for storage. Shutdown finishes the pending save, and save errors are surfaced.
+Esc, Ctrl-C, or closing the window exits.
 
 ### Separate-sync mode for effects
 
@@ -256,15 +262,37 @@ retains the last image while searching for the next header.
 
 ## Implementation and limitations
 
-SSTV encoding is precomputed outside JACK callbacks, in a worker for the GUI.
-Its output callbacks only copy samples. NBTV output callbacks perform a simple
-allocation-free raster lookup into prepared grayscale frames. Input callbacks
+SSTV encoding is precomputed into a temporary disk cache outside JACK callbacks,
+in a worker for the GUI. A background reader feeds bounded, reusable memory
+pages to playback; JACK never reads files, allocates cache pages, or waits for
+the reader. NBTV uses the same mechanism for its grayscale-frame cache, with
+allocation-free raster lookup in its output callback. Input callbacks
 transfer samples into bounded, lock-free two-second ring buffers.
 A worker decodes SSTV rows using
 [`sstv`](https://github.com/unexcellent/sstv); the main thread displays them
 using egui/eframe with an OpenGL renderer, as does the encoder GUI. Protocol
 changes transfer prepared audio through bounded lock-free queues; old audio is
 freed outside the JACK callback. Audio is never routed to speakers automatically.
+
+The cache retains the start of the clip in RAM, so local Play, transport
+restarts, and Repeat can begin immediately while the background reader refills
+later pages. At 48 kHz, SSTV uses about 750 KiB for cached waveform pages,
+independent of protocol duration; NBTV frame pages use about 96 KiB, independent
+of video duration. Source-image decoding, application state, and graphics
+resources use additional memory. SSTV disk usage is four bytes per audio sample,
+including silence (about 75 MiB for Pasokon P7 at 48 kHz).
+
+Temporary caches use the operating system's temporary directory and are removed
+when closed. If that directory is RAM-backed (for example a Linux `/tmp` mounted
+as `tmpfs`), set `TMPDIR` to an existing writable directory on disk to avoid
+storing the cache in RAM. Sufficient free temporary storage is required.
+Cache preparation/read failures are reported explicitly and stop playback.
+If read-ahead cannot keep up, missing picture/audio samples become silence
+without changing the playback clock, and underrun counts are reported on stderr.
+
+Decoder textures are updated only when picture data changes, including Reset;
+color conversion and GPU upload happen outside reception locks. Snapshot and
+color buffers are reused when possible.
 
 Both applications use JACK's negotiated sample rate. Sample-rate changes require
 a restart. JACK xruns and receiver buffer overflows are reported on stderr;

@@ -15,6 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 jack = "0.14"
 rtrb = "0.4"
 sstv = { version = "0.3.1", features = ["image"] }
+tempfile = "3"
 
 [[bin]]
 name = "sstv-encoder"

@@ -30,6 +30,7 @@ struct Display {
     height: usize,
     pixels: Vec<u32>,
     title: String,
+    revision: usize,
 }
 
 impl Display {
@@ -39,6 +40,7 @@ impl Display {
             height: 240,
             pixels: vec![0; 320 * 240],
             title: "SSTV - waiting for a transmission".into(),
+            revision: 0,
         }
     }
 }
@@ -73,6 +75,7 @@ fn receive(
             frame.width = width;
             frame.height = height;
             frame.pixels = vec![0; width * height];
+            frame.revision = frame.revision.wrapping_add(1);
             frame.title = format!("SSTV - {mode:?} - receiving {width}x{height}");
         }
         let mut received = 0;
@@ -93,6 +96,7 @@ fn receive(
                     | u32::from(pixel.blue());
             }
             received += 1;
+            frame.revision = frame.revision.wrapping_add(1);
             frame.title = format!("SSTV - {mode:?} - {width}x{height} - row {received}/{height}");
         }
         if !state.is_running() || reset.load(Ordering::Acquire) {
@@ -136,9 +140,13 @@ fn receive_live(
     while state.is_running() {
         if reset.load(Ordering::Acquire) {
             samples.discard_buffered();
-            *display
+            let mut frame = display
                 .lock()
-                .map_err(|_| anyhow!("Display lock poisoned"))? = Display::waiting();
+                .map_err(|_| anyhow!("Display lock poisoned"))?;
+            let revision = frame.revision.wrapping_add(1);
+            *frame = Display::waiting();
+            frame.revision = revision;
+            drop(frame);
             reset.store(false, Ordering::Release);
             eprintln!("Decoder reset. Listening for a new transmission header.");
         }
@@ -166,6 +174,52 @@ struct DecoderApp {
     texture: Option<egui::TextureHandle>,
     last_dropped: usize,
     last_xruns: usize,
+    uploaded_revision: Option<usize>,
+    snapshot: Vec<u32>,
+    last_title: String,
+    color_image: Arc<egui::ColorImage>,
+}
+
+impl DecoderApp {
+    fn refresh_texture(&mut self, ctx: &egui::Context) -> Result<()> {
+        let frame = self
+            .display
+            .lock()
+            .map_err(|_| anyhow!("Display lock poisoned"))?;
+        if self.last_title != frame.title {
+            self.last_title.clone_from(&frame.title);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.last_title.clone()));
+        }
+        let changed = self.uploaded_revision != Some(frame.revision);
+        let size = [frame.width, frame.height];
+        if changed {
+            self.snapshot.clone_from(&frame.pixels);
+            self.uploaded_revision = Some(frame.revision);
+        }
+        drop(frame);
+        if changed {
+            let image = Arc::make_mut(&mut self.color_image);
+            image.size = size;
+            image.source_size = egui::vec2(size[0] as f32, size[1] as f32);
+            image
+                .pixels
+                .resize(self.snapshot.len(), egui::Color32::BLACK);
+            for (target, pixel) in image.pixels.iter_mut().zip(&self.snapshot) {
+                *target =
+                    egui::Color32::from_rgb((pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8);
+            }
+            if let Some(texture) = &mut self.texture {
+                texture.set(Arc::clone(&self.color_image), egui::TextureOptions::NEAREST);
+            } else {
+                self.texture = Some(ctx.load_texture(
+                    "reception",
+                    Arc::clone(&self.color_image),
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl eframe::App for DecoderApp {
@@ -176,28 +230,11 @@ impl eframe::App for DecoderApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let frame = match self.display.lock() {
-            Ok(frame) => frame,
-            Err(_) => {
-                eprintln!("Display lock poisoned");
-                self.state.stop();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(frame.title.clone()));
-        let rgb: Vec<u8> = frame
-            .pixels
-            .iter()
-            .flat_map(|pixel| [(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8])
-            .collect();
-        let image = egui::ColorImage::from_rgb([frame.width, frame.height], &rgb);
-        drop(frame);
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::NEAREST);
-        } else {
-            self.texture =
-                Some(ctx.load_texture("reception", image, egui::TextureOptions::NEAREST));
+        if let Err(error) = self.refresh_texture(ctx) {
+            eprintln!("{error:#}");
+            self.state.stop();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -313,6 +350,10 @@ fn main() -> Result<()> {
         texture: None,
         last_dropped: 0,
         last_xruns: 0,
+        uploaded_revision: None,
+        snapshot: Vec::new(),
+        last_title: String::new(),
+        color_image: Arc::new(egui::ColorImage::new([0, 0], Vec::new())),
     };
     let result = eframe::run_native(
         "SSTV - waiting for a transmission",
@@ -339,6 +380,67 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use sstv::{Encoder, RgbPixel, Synthesizer, modes::ROBOT_36};
+
+    #[test]
+    fn texture_uploads_only_on_picture_changes_including_reset() {
+        let display = Arc::new(Mutex::new(Display::waiting()));
+        let mut app = DecoderApp {
+            display: Arc::clone(&display),
+            state: RunState::new(),
+            reset: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            worker_finished: Arc::new(AtomicBool::new(false)),
+            texture: None,
+            last_dropped: 0,
+            last_xruns: 0,
+            uploaded_revision: None,
+            snapshot: Vec::new(),
+            last_title: String::new(),
+            color_image: Arc::new(egui::ColorImage::new([0, 0], Vec::new())),
+        };
+        let ctx = egui::Context::default();
+        let first = ctx.run(Default::default(), |ctx| app.refresh_texture(ctx).unwrap());
+        let texture = app.texture.as_ref().unwrap().id();
+        assert!(
+            first
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        display.lock().unwrap().title = "Title only".into();
+        let idle = ctx.run(Default::default(), |ctx| app.refresh_texture(ctx).unwrap());
+        assert!(!idle.textures_delta.set.iter().any(|(id, _)| *id == texture));
+        {
+            let mut frame = display.lock().unwrap();
+            frame.pixels[0] = 0xff_ffff;
+            frame.revision += 1;
+        }
+        let changed = ctx.run(Default::default(), |ctx| app.refresh_texture(ctx).unwrap());
+        assert!(
+            changed
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        assert_eq!(app.color_image.pixels[0], egui::Color32::WHITE);
+        {
+            let mut frame = display.lock().unwrap();
+            let revision = frame.revision + 1;
+            *frame = Display::waiting();
+            frame.revision = revision;
+        }
+        let reset = ctx.run(Default::default(), |ctx| app.refresh_texture(ctx).unwrap());
+        assert!(
+            reset
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        assert_eq!(app.color_image.pixels[0], egui::Color32::BLACK);
+    }
 
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

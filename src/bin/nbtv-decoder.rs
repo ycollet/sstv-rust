@@ -27,7 +27,7 @@ struct Args {
     /// Delay clean sync to match picture-path latency (separate-sync only).
     #[arg(long, default_value_t = 0.0, value_parser = sync_delay_ms)]
     sync_delay_ms: f64,
-    /// Save the latest complete frame as a PNG (overwritten at video rate).
+    /// Save frames as a PNG; keep the latest pending frame if storage falls behind.
     #[arg(long)]
     output: Option<PathBuf>,
     /// Synchronization threshold in JACK signal units; sync must be below it.
@@ -61,6 +61,7 @@ struct Reception {
     pixels: Vec<u8>,
     frames: usize,
     locked: bool,
+    revision: usize,
 }
 
 impl Reception {
@@ -69,6 +70,7 @@ impl Reception {
             pixels: vec![0; nbtv::FRAME_PIXELS],
             frames: 0,
             locked: false,
+            revision: 0,
         }
     }
 }
@@ -82,13 +84,38 @@ struct Shared {
     delay_samples: AtomicUsize,
     dropped: AtomicUsize,
     finished: AtomicBool,
+    skipped_saves: Arc<AtomicUsize>,
 }
 
 fn receive(
-    mut consumer: rtrb::Consumer<(f32, f32)>,
+    consumer: rtrb::Consumer<(f32, f32)>,
     shared: &Shared,
     sample_rate: u32,
     output: Option<PathBuf>,
+) -> Result<()> {
+    let mut saver =
+        output.map(|path| nbtv::saving::FrameSaver::new(path, Arc::clone(&shared.skipped_saves)));
+    let result = receive_frames(consumer, shared, sample_rate, &mut saver);
+    let saving = if let Some(saver) = &mut saver {
+        saver.finish()
+    } else {
+        Ok(())
+    };
+    if let Err(error) = saving {
+        if result.is_err() {
+            eprintln!("{error:#}");
+        } else {
+            return Err(error);
+        }
+    }
+    result
+}
+
+fn receive_frames(
+    mut consumer: rtrb::Consumer<(f32, f32)>,
+    shared: &Shared,
+    sample_rate: u32,
+    saver: &mut Option<nbtv::saving::FrameSaver>,
 ) -> Result<()> {
     let mut decoder = nbtv::Decoder::new(sample_rate)?;
     let mut separate = shared.separate.load(Ordering::Acquire);
@@ -111,15 +138,22 @@ fn receive(
             } else {
                 0
             });
-            *shared
+            let mut reception = shared
                 .reception
                 .lock()
-                .map_err(|_| anyhow!("Reception lock poisoned"))? = Reception::new();
+                .map_err(|_| anyhow!("Reception lock poisoned"))?;
+            let revision = reception.revision.wrapping_add(1);
+            *reception = Reception::new();
+            reception.revision = revision;
+            drop(reception);
             shared.reset.store(false, Ordering::Release);
         }
         let (picture, sync) = match consumer.pop() {
             Ok(sample) => sample,
             Err(_) => {
+                if let Some(saver) = saver {
+                    saver.check()?;
+                }
                 std::thread::sleep(POLL_INTERVAL);
                 continue;
             }
@@ -127,15 +161,8 @@ fn receive(
         let threshold = f32::from_bits(shared.threshold.load(Ordering::Relaxed));
         let sync = if separate { delay.push(sync) } else { picture };
         if let Some(pixels) = decoder.push_channels(picture, sync, threshold) {
-            if let Some(path) = &output {
-                image::save_buffer(
-                    path,
-                    &pixels,
-                    nbtv::WIDTH as u32,
-                    nbtv::HEIGHT as u32,
-                    image::ColorType::L8,
-                )
-                .with_context(|| format!("Cannot save frame to {}", path.display()))?;
+            if let Some(saver) = saver {
+                saver.submit(&pixels)?;
             }
             let mut reception = shared
                 .reception
@@ -143,6 +170,7 @@ fn receive(
                 .map_err(|_| anyhow!("Reception lock poisoned"))?;
             reception.pixels = pixels;
             reception.frames += 1;
+            reception.revision = reception.revision.wrapping_add(1);
         }
         if until_status == 0 {
             shared
@@ -163,6 +191,61 @@ struct DecoderApp {
     last_dropped: usize,
     last_xruns: usize,
     sample_rate: u32,
+    uploaded_revision: Option<usize>,
+    snapshot: Vec<u8>,
+    last_title: String,
+    last_skipped_saves: usize,
+    color_image: Arc<egui::ColorImage>,
+}
+
+impl DecoderApp {
+    fn refresh_texture(&mut self, ctx: &egui::Context) -> Result<usize> {
+        let (changed, frames, locked) = {
+            let reception = self
+                .shared
+                .reception
+                .lock()
+                .map_err(|_| anyhow!("Reception lock poisoned"))?;
+            let changed = self.uploaded_revision != Some(reception.revision);
+            if changed {
+                self.snapshot.clone_from(&reception.pixels);
+                self.uploaded_revision = Some(reception.revision);
+            }
+            (changed, reception.frames, reception.locked)
+        };
+        let title = format!(
+            "NBTV {} - 32-line - 12.5 fps - {}",
+            nbtv::Mode::from_separate(self.shared.separate.load(Ordering::Acquire)).label(),
+            if locked {
+                "sync locked"
+            } else {
+                "searching for sync"
+            }
+        );
+        if self.last_title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+        if changed {
+            let image = Arc::make_mut(&mut self.color_image);
+            image
+                .pixels
+                .resize(self.snapshot.len(), egui::Color32::BLACK);
+            for (target, value) in image.pixels.iter_mut().zip(&self.snapshot) {
+                *target = egui::Color32::from_gray(*value);
+            }
+            if let Some(texture) = &mut self.texture {
+                texture.set(Arc::clone(&self.color_image), egui::TextureOptions::NEAREST);
+            } else {
+                self.texture = Some(ctx.load_texture(
+                    "nbtv",
+                    Arc::clone(&self.color_image),
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+        }
+        Ok(frames)
+    }
 }
 
 impl eframe::App for DecoderApp {
@@ -173,29 +256,14 @@ impl eframe::App for DecoderApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let (pixels, frames, locked) = match self.shared.reception.lock() {
-            Ok(reception) => (reception.pixels.clone(), reception.frames, reception.locked),
-            Err(_) => {
-                eprintln!("Reception lock poisoned");
+        let frames = match self.refresh_texture(ctx) {
+            Ok(frames) => frames,
+            Err(error) => {
+                eprintln!("{error:#}");
                 self.shared.state.stop();
                 return;
             }
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "NBTV {} - 32-line - 12.5 fps - {}",
-            nbtv::Mode::from_separate(self.shared.separate.load(Ordering::Acquire)).label(),
-            if locked {
-                "sync locked"
-            } else {
-                "searching for sync"
-            }
-        )));
-        let image = egui::ColorImage::from_gray([nbtv::WIDTH, nbtv::HEIGHT], &pixels);
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::NEAREST);
-        } else {
-            self.texture = Some(ctx.load_texture("nbtv", image, egui::TextureOptions::NEAREST));
-        }
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             let mut mode = nbtv::Mode::from_separate(self.shared.separate.load(Ordering::Acquire));
             let previous = mode;
@@ -277,6 +345,13 @@ impl eframe::App for DecoderApp {
             eprintln!("Warning: NBTV input overflow, {dropped} samples lost.");
             self.last_dropped = dropped;
         }
+        let skipped = self.shared.skipped_saves.load(Ordering::Relaxed);
+        if skipped != self.last_skipped_saves {
+            eprintln!(
+                "Warning: frame saving is behind; {skipped} superseded frames were not saved."
+            );
+            self.last_skipped_saves = skipped;
+        }
         let xruns = self.shared.state.xruns.load(Ordering::Relaxed);
         if xruns != self.last_xruns {
             eprintln!("Warning: JACK xrun count {xruns}; NBTV synchronization may be damaged.");
@@ -310,6 +385,7 @@ fn main() -> Result<()> {
         ),
         dropped: AtomicUsize::new(0),
         finished: AtomicBool::new(false),
+        skipped_saves: Arc::new(AtomicUsize::new(0)),
     });
     let callback_shared = Arc::clone(&shared);
     let process = jack::contrib::ClosureProcessHandler::new(
@@ -361,6 +437,14 @@ fn main() -> Result<()> {
         last_dropped: 0,
         last_xruns: 0,
         sample_rate,
+        uploaded_revision: None,
+        snapshot: Vec::new(),
+        last_title: String::new(),
+        last_skipped_saves: 0,
+        color_image: Arc::new(egui::ColorImage::new(
+            [nbtv::WIDTH, nbtv::HEIGHT],
+            vec![egui::Color32::BLACK; nbtv::FRAME_PIXELS],
+        )),
     };
     let result = eframe::run_native(
         "NBTV decoder",
@@ -386,6 +470,87 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn texture_uploads_only_on_new_frames_or_reset() {
+        let shared = Arc::new(Shared {
+            state: RunState::new(),
+            reception: Mutex::new(Reception::new()),
+            reset: AtomicBool::new(false),
+            threshold: AtomicU32::new(nbtv::DEFAULT_THRESHOLD.to_bits()),
+            separate: AtomicBool::new(false),
+            delay_samples: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
+            skipped_saves: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut app = DecoderApp {
+            shared: Arc::clone(&shared),
+            texture: None,
+            last_dropped: 0,
+            last_xruns: 0,
+            sample_rate: 48_000,
+            uploaded_revision: None,
+            snapshot: Vec::new(),
+            last_title: String::new(),
+            last_skipped_saves: 0,
+            color_image: Arc::new(egui::ColorImage::new(
+                [nbtv::WIDTH, nbtv::HEIGHT],
+                vec![egui::Color32::BLACK; nbtv::FRAME_PIXELS],
+            )),
+        };
+        let ctx = egui::Context::default();
+        let first = ctx.run(Default::default(), |ctx| {
+            app.refresh_texture(ctx).unwrap();
+        });
+        let texture = app.texture.as_ref().unwrap().id();
+        assert!(
+            first
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        shared.reception.lock().unwrap().locked = true;
+        let idle = ctx.run(Default::default(), |ctx| {
+            app.refresh_texture(ctx).unwrap();
+        });
+        assert!(!idle.textures_delta.set.iter().any(|(id, _)| *id == texture));
+        {
+            let mut frame = shared.reception.lock().unwrap();
+            frame.pixels[0] = 255;
+            frame.frames += 1;
+            frame.revision += 1;
+        }
+        let changed = ctx.run(Default::default(), |ctx| {
+            app.refresh_texture(ctx).unwrap();
+        });
+        assert!(
+            changed
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        assert_eq!(app.color_image.pixels[0], egui::Color32::WHITE);
+        {
+            let mut frame = shared.reception.lock().unwrap();
+            let revision = frame.revision + 1;
+            *frame = Reception::new();
+            frame.revision = revision;
+        }
+        let reset = ctx.run(Default::default(), |ctx| {
+            app.refresh_texture(ctx).unwrap();
+        });
+        assert!(
+            reset
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        assert_eq!(app.color_image.pixels[0], egui::Color32::BLACK);
+    }
+
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -409,6 +574,7 @@ mod tests {
             delay_samples: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
+            skipped_saves: Arc::new(AtomicUsize::new(0)),
         });
         let (mut producer, consumer) = rtrb::RingBuffer::new(96_000);
         let worker_shared = Arc::clone(&shared);

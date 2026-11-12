@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -7,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use rtrb::Consumer;
 
+mod cache;
 pub mod nbtv;
 pub mod transmit;
 
@@ -140,6 +142,7 @@ pub struct Playback {
     content: PlaybackContent,
     position: usize,
     repeat: bool,
+    underruns: usize,
 }
 
 #[derive(Debug)]
@@ -147,6 +150,15 @@ enum PlaybackContent {
     Pcm(Vec<f32>),
     Nbtv {
         clip: Arc<nbtv::Clip>,
+        sample_rate: u32,
+    },
+    CachedPcm {
+        cache: cache::ReadAhead,
+        length: usize,
+    },
+    CachedNbtv {
+        cache: cache::ReadAhead,
+        frames: usize,
         sample_rate: u32,
     },
 }
@@ -158,6 +170,7 @@ impl Playback {
             content: PlaybackContent::Pcm(samples),
             position: 0,
             repeat,
+            underruns: 0,
         }
     }
 
@@ -166,6 +179,56 @@ impl Playback {
             content: PlaybackContent::Nbtv { clip, sample_rate },
             position: 0,
             repeat: false,
+            underruns: 0,
+        }
+    }
+
+    pub fn cached_pcm(file: File, length: usize, sample_rate: u32) -> Result<Self> {
+        Ok(Self {
+            content: PlaybackContent::CachedPcm {
+                cache: cache::ReadAhead::new(
+                    file,
+                    length
+                        .checked_mul(4)
+                        .ok_or_else(|| anyhow::anyhow!("Audio cache is too large"))?,
+                    (sample_rate as usize / 2).max(1) * 4,
+                )?,
+                length,
+            },
+            position: 0,
+            repeat: false,
+            underruns: 0,
+        })
+    }
+
+    pub fn cached_nbtv(file: File, frames: usize, sample_rate: u32) -> Result<Self> {
+        Ok(Self {
+            content: PlaybackContent::CachedNbtv {
+                cache: cache::ReadAhead::new(
+                    file,
+                    frames
+                        .checked_mul(nbtv::FRAME_PIXELS)
+                        .ok_or_else(|| anyhow::anyhow!("Video cache is too large"))?,
+                    nbtv::FRAME_PIXELS * 8,
+                )?,
+                frames,
+                sample_rate,
+            },
+            position: 0,
+            repeat: false,
+            underruns: 0,
+        })
+    }
+
+    pub fn underruns(&self) -> usize {
+        self.underruns
+    }
+
+    pub fn failed(&self) -> bool {
+        match &self.content {
+            PlaybackContent::CachedPcm { cache, .. }
+            | PlaybackContent::CachedNbtv { cache, .. } => cache.failed(),
+            _ => false,
         }
     }
 
@@ -195,10 +258,10 @@ impl Playback {
         }
         for (index, sample) in output.iter_mut().enumerate() {
             if self.position == length && self.repeat {
-                self.position = 0;
+                self.restart();
             }
             if self.position < length {
-                *sample = match &self.content {
+                *sample = match &mut self.content {
                     PlaybackContent::Pcm(samples) => samples[self.position],
                     PlaybackContent::Nbtv { clip, sample_rate } => {
                         let picture = clip.sample(self.position, *sample_rate);
@@ -209,6 +272,42 @@ impl Playback {
                             picture.max(0.0)
                         } else {
                             picture
+                        }
+                    }
+                    PlaybackContent::CachedPcm { cache, .. } => {
+                        if let Some(bytes) = cache.bytes_at(self.position * 4, 4) {
+                            f32::from_le_bytes(
+                                bytes.try_into().expect("An audio sample is four bytes"),
+                            )
+                        } else {
+                            self.underruns += 1;
+                            0.0
+                        }
+                    }
+                    PlaybackContent::CachedNbtv {
+                        cache,
+                        frames,
+                        sample_rate,
+                    } => {
+                        let frame = nbtv::frame_index(self.position, *sample_rate).min(*frames - 1);
+                        if let Some(pixels) =
+                            cache.bytes_at(frame * nbtv::FRAME_PIXELS, nbtv::FRAME_PIXELS)
+                        {
+                            let picture = nbtv::sample_frame(pixels, self.position, *sample_rate);
+                            if separate {
+                                if let Some(sync) = &mut sync {
+                                    sync[index] = nbtv::sync_sample(self.position, *sample_rate);
+                                }
+                                picture.max(0.0)
+                            } else {
+                                picture
+                            }
+                        } else {
+                            self.underruns += 1;
+                            if separate && let Some(sync) = &mut sync {
+                                sync[index] = nbtv::sync_sample(self.position, *sample_rate);
+                            }
+                            0.0
                         }
                     }
                 };
@@ -222,6 +321,11 @@ impl Playback {
 
     pub fn restart(&mut self) {
         self.position = 0;
+        match &mut self.content {
+            PlaybackContent::CachedPcm { cache, .. }
+            | PlaybackContent::CachedNbtv { cache, .. } => cache.restart(),
+            _ => {}
+        }
     }
 
     pub fn set_repeat(&mut self, repeat: bool) {
@@ -236,6 +340,12 @@ impl Playback {
         match &self.content {
             PlaybackContent::Pcm(samples) => samples.len(),
             PlaybackContent::Nbtv { clip, sample_rate } => clip.samples(*sample_rate),
+            PlaybackContent::CachedPcm { length, .. } => *length,
+            PlaybackContent::CachedNbtv {
+                frames,
+                sample_rate,
+                ..
+            } => nbtv::frame_samples(*frames, *sample_rate),
         }
     }
 
@@ -247,6 +357,7 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn playback_preserves_samples_across_callbacks_and_drains_before_finishing() {
@@ -266,6 +377,73 @@ mod tests {
         let mut block = [0.0; 5];
         assert!(!playback.fill(&mut block));
         assert_eq!(block, [0.1, 0.2, 0.1, 0.2, 0.1]);
+    }
+
+    #[test]
+    fn cached_pcm_repeats_and_restarts_with_exact_samples() {
+        let samples: Vec<f32> = (0..256).map(|i| i as f32 / 256.0).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        for sample in &samples {
+            file.write_all(&sample.to_le_bytes()).unwrap();
+        }
+        let mut playback = Playback::cached_pcm(file, samples.len(), 32).unwrap();
+        playback.set_repeat(true);
+        let mut output = [0.0; 8];
+        for _ in 0..2 {
+            playback.restart();
+            for block in 0..70 {
+                playback.fill(&mut output);
+                for (i, sample) in output.iter().enumerate() {
+                    assert_eq!(*sample, samples[(block * 8 + i) % samples.len()]);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        assert_eq!(playback.underruns(), 0);
+    }
+
+    #[test]
+    fn cached_nbtv_matches_the_in_memory_raster_through_repeat_and_mode_changes() {
+        let pixels: Vec<u8> = (0..nbtv::FRAME_PIXELS * 100)
+            .map(|i| (i / 32 % 256) as u8)
+            .collect();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&pixels).unwrap();
+        let clip = nbtv::Clip::new(pixels).unwrap();
+        let rate = 32_000;
+        let length = clip.samples(rate);
+        let mut playback = Playback::cached_nbtv(file, clip.frames(), rate).unwrap();
+        playback.set_repeat(true);
+        let mut picture = [0.0; 2048];
+        let mut sync = [0.0; 2048];
+        for separate in [false, true] {
+            playback.restart();
+            for block in 0..(length / 2048 + 4) {
+                playback.fill_with_sync(&mut picture, &mut sync, separate);
+                for index in 0..2048 {
+                    let position = (block * 2048 + index) % length;
+                    let expected = clip.sample(position, rate);
+                    assert_eq!(
+                        picture[index],
+                        if separate {
+                            expected.max(0.0)
+                        } else {
+                            expected
+                        }
+                    );
+                    assert_eq!(
+                        sync[index],
+                        if separate {
+                            nbtv::sync_sample(position, rate)
+                        } else {
+                            0.0
+                        }
+                    );
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        assert_eq!(playback.underruns(), 0);
     }
 
     #[test]

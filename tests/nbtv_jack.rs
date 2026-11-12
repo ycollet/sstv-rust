@@ -1,5 +1,6 @@
 //! Opt-in live smoke test, restricted to an explicitly named test server.
 
+use std::io::Write;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -7,8 +8,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use sstv_jack::{
-    Playback,
-    nbtv::{self, Clip},
+    Playback, nbtv,
     transmit::{Controls, Transmitter},
 };
 
@@ -49,15 +49,14 @@ fn run_transport_test(separate: bool) {
     controls.follow_transport.store(true, Ordering::Release);
     controls.repeat.store(true, Ordering::Relaxed);
     let (mut transmitter, mut exchange) = Transmitter::new(Arc::clone(&controls));
-    let clip = Clip::new(
-        (0..nbtv::FRAME_PIXELS * 25)
-            .map(|index| (index % 32 * 255 / 31) as u8)
-            .collect(),
-    )
-    .unwrap();
+    let pixels: Vec<u8> = (0..nbtv::FRAME_PIXELS * 100)
+        .map(|index| (index % 32 * 255 / 31) as u8)
+        .collect();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&pixels).unwrap();
     exchange
         .pending
-        .push(Playback::nbtv(Arc::new(clip), sample_rate))
+        .push(Playback::cached_nbtv(file, 100, sample_rate).unwrap())
         .unwrap();
     let transport = sender.transport();
     transport.stop().unwrap();
@@ -144,7 +143,7 @@ fn run_transport_test(separate: bool) {
     drain_for(Duration::from_millis(100));
     let stopped_silence = signals.load(Ordering::Relaxed) == 0;
     transport.start().unwrap();
-    drain_for(Duration::from_millis(600));
+    drain_for(Duration::from_millis(3500));
     let first = frames.load(Ordering::Relaxed);
     transport.stop().unwrap();
     drain_for(Duration::from_millis(100));
@@ -158,7 +157,7 @@ fn run_transport_test(separate: bool) {
     rx.deactivate().unwrap();
     assert!(stopped_silence);
     assert!(
-        first >= 3,
+        first >= 30,
         "Only {first} frames decoded during initial transport run"
     );
     assert!(stopped, "Signal did not stop with JACK transport");
@@ -167,4 +166,6 @@ fn run_transport_test(separate: bool) {
         "No frames decoded after restart"
     );
     assert_eq!(overflows.load(Ordering::Relaxed), 0);
+    assert_eq!(controls.underruns(), 0, "Disk read-ahead failed to keep up");
+    assert!(!controls.cache_failed.load(Ordering::Acquire));
 }

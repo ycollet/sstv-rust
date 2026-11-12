@@ -50,15 +50,22 @@ struct EncoderApp {
     monitor: jack::Port<jack::Unowned>,
     sync_monitor: jack::Port<jack::Unowned>,
     separate: Arc<AtomicBool>,
-    loader: Option<JoinHandle<Result<Arc<nbtv::Clip>>>>,
+    loader: Option<JoinHandle<Result<(Playback, usize)>>>,
     sample_rate: u32,
     frames: usize,
     error: Option<String>,
     last_xruns: usize,
+    last_underruns: usize,
 }
 
 impl eframe::App for EncoderApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if let Err(error) = self.controls.check_playback(&mut self.last_underruns)
+            && self.error.is_none()
+        {
+            eprintln!("{error:#}");
+            self.error = Some(format!("{error:#}"));
+        }
         while let Ok(previous) = self.exchange.retired.pop() {
             drop(previous);
         }
@@ -70,11 +77,11 @@ impl eframe::App for EncoderApp {
                 .join()
                 .map_err(|_| anyhow!("Media loading worker panicked"))
                 .and_then(|result| result)
-                .and_then(|clip| {
-                    self.frames = clip.frames();
+                .and_then(|(playback, frames)| {
+                    self.frames = frames;
                     self.exchange
                         .pending
-                        .push(Playback::nbtv(clip, self.sample_rate))
+                        .push(playback)
                         .map_err(|_| anyhow!("Audio preparation queue is full"))
                 });
             if let Err(error) = result {
@@ -276,12 +283,14 @@ fn main() -> Result<()> {
             );
             exchange
                 .pending
-                .push(Playback::nbtv(clip, sample_rate))
+                .push(clip.into_playback(sample_rate)?)
                 .map_err(|_| anyhow!("Audio preparation queue is full"))?;
             let mut started = false;
             let mut seen_playing = false;
             let mut last_xruns = 0;
+            let mut last_underruns = 0;
             while state.is_running() {
+                controls.check_playback(&mut last_underruns)?;
                 if !args.follow_transport
                     && !started
                     && controls.ready.load(Ordering::Acquire)
@@ -308,7 +317,11 @@ fn main() -> Result<()> {
         } else {
             let load_state = Arc::clone(&state);
             let path = args.input.clone();
-            let loader = std::thread::spawn(move || nbtv::media::load(&path, &load_state));
+            let loader = std::thread::spawn(move || {
+                let clip = nbtv::media::load(&path, &load_state)?;
+                let frames = clip.frames();
+                Ok((clip.into_playback(sample_rate)?, frames))
+            });
             let app = EncoderApp {
                 path: args.input.display().to_string(),
                 controls: Arc::clone(&controls),
@@ -322,6 +335,7 @@ fn main() -> Result<()> {
                 frames: 0,
                 error: None,
                 last_xruns: 0,
+                last_underruns: 0,
             };
             eframe::run_native(
                 "NBTV encoder",
@@ -341,6 +355,7 @@ fn main() -> Result<()> {
     if controls.transport_failed.load(Ordering::Relaxed) {
         bail!("Cannot query JACK transport");
     }
+    controls.check_playback(&mut 0)?;
     result?;
     deactivation?;
     Ok(())
