@@ -1,10 +1,14 @@
-# SSTV over JACK
+# SSTV and NBTV over JACK
 
-Two independent Rust applications for still-image experiments:
+Independent Rust applications for still-image SSTV and moving-video NBTV
+experiments:
 
 ```text
 sstv-encoder:output -> [optional JACK audio effects] -> sstv-decoder:input
+nbtv-encoder:output -> [optional JACK audio effects] -> nbtv-decoder:input
 ```
+
+The two formats are separate: an SSTV decoder cannot receive NBTV, or vice versa.
 
 The encoder transmits a PNG or JPEG using a selectable SSTV protocol (Robot 36
 by default). The receiver
@@ -25,7 +29,7 @@ Install Rust 1.88 or newer and JACK development libraries. On Debian/Ubuntu:
 ```sh
 sudo apt install build-essential pkg-config libjack-jackd2-dev \
     libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev \
-    libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev
+    libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev ffmpeg
 cargo build --release
 ```
 
@@ -35,7 +39,86 @@ application with `pw-jack`. Both must use the same server. A graphical desktop
 is required by the encoder GUI and receiver. Neither application starts an
 audio server.
 
-## Direct transmission
+## NBTV: moving video and still images
+
+Start the receiver, then the encoder in a second terminal:
+
+```sh
+./target/release/nbtv-decoder
+./target/release/nbtv-encoder movie.mp4 --connect nbtv-decoder:input
+```
+
+In the encoder window, press **Play**. **Stop**, **Repeat**, and opt-in
+**Follow JACK transport** work like the SSTV encoder's controls: starting
+transport restarts the clip, stopping cancels it, and local buttons never change
+global transport. NBTV supports one fixed format: **Club 32-line monochrome at
+12.5 frames per second**. There is no protocol negotiation or selector.
+
+PNG/JPEG input also works:
+
+```sh
+./target/release/nbtv-encoder picture.png --repeat --connect nbtv-decoder:input
+```
+
+A still becomes a two-second clip. Repeat loops the entire clip without the
+SSTV encoder's two-second silence. Video is converted to 12.5 fps; source
+soundtracks are not transmitted. Images are fitted into a portrait **32 x 48**
+grayscale raster with black padding to preserve aspect ratio. This is intentionally
+very low-resolution video, not a way to send full-resolution MP4 over audio.
+
+FFmpeg must be available on `PATH` for MP4 and other video formats. PNG/JPEG
+does not require FFmpeg. Media is loaded and resized before playback; the GUI
+remains responsive while its worker prepares it. Resized video is held in RAM
+(approximately 19.2 kB per second, or 69 MB per hour), rather than precomputing a
+much larger audio recording. Loading long/high-resolution files may take time.
+Playback then runs at JACK's audio clock, not the media loader's speed.
+
+The encoder also supports `--headless`, `--repeat`, `--follow-transport`,
+`--name`, and `--connect`. Without transport following, headless playback starts
+when connected and exits at the end of the clip unless Repeat is enabled.
+
+The decoder title shows the format and synchronization status. It searches for
+embedded frame synchronization continuously, including after signal loss;
+**Reset** clears reception and discards buffered input without reconnecting JACK.
+Initial acquisition normally needs roughly two frames (160 ms); this is not a
+guaranteed end-to-end latency. The first and last source frames may not be
+displayed while acquiring sync or waiting for the next boundary.
+`--output latest.png` saves each completed frame, overwriting that path at video
+rate. Esc, Ctrl-C, or closing the window exits.
+
+### NBTV effects and compatibility
+
+Route the NBTV ports through effects using the same JACK patchbay workflow as
+SSTV. Do not mix the SSTV and NBTV signals. NBTV encodes brightness as amplitude:
+gain, clipping, filtering, and delay affect the picture directly.
+
+The format follows the [NBTV Association club standard](https://www.nbtv.org.uk/standards.htm):
+32 vertical scans, bottom to top and right to left, at 400 lines per second.
+The encoder uses 200 microsecond negative sync pulses; the pulse between line
+32 and line 1 is omitted and replaced with black to identify each frame.
+It does **not** use a custom broad frame-sync pulse.
+
+JACK signal levels are **sync -0.32, black 0.0, white +0.8**; the sync excursion
+is 40% of the black-to-white range. These are digital signal units, not a
+guaranteed analog voltage at a sound card. Active video is linearly interpolated,
+with 50 microsecond black porches before and after each active scan. JACK must
+run at 32 kHz or higher; 44.1/48 kHz are suitable.
+
+The receiver's **Sync threshold** slider (also `--threshold`, default `-0.12`)
+can compensate for moderate level changes. Sync must fall below the threshold
+and black/active video must stay above it. Changing the slider resets reception.
+There is no automatic gain control, DC restoration, or polarity detection;
+external recordings/hardware and AC-coupled effects may need level, offset, and
+polarity adjustment. External hardware interoperability has not been verified.
+
+There is **no initial two-second header to protect**, unlike SSTV. Line sync
+is present throughout the video, so begin with a mostly dry signal and low
+feedback. Strong effects can still destroy sync. A path passing the recommended
+2 Hz-10 kHz NBTV band is a useful starting point; ordinary audio high-pass
+filters can remove important low-frequency picture information. MP3 and other
+lossy audio codecs are not appropriate for transparent NBTV transport.
+
+## SSTV: direct transmission
 
 Start the receiver first:
 
@@ -65,6 +148,13 @@ The receiver stays open; Esc, Ctrl-C,
 or closing its window exits. `--output` is optional and saves each complete
 image, overwriting the previous one. PNG is recommended for the output.
 `--name` changes either application's JACK client name.
+
+The receiver's title bar shows the detected protocol during reception and after
+completion. **Reset** cancels the current reception, discards buffered input,
+clears the image and protocol, and listens for a new header without reconnecting
+JACK. Click Reset before starting the next transmission, especially when
+switching protocols after an interrupted or damaged image. Reset does not stop
+the encoder or change JACK transport, and an abandoned image is not saved.
 
 To connect manually, omit `--connect` and use a JACK patchbay or:
 
@@ -126,11 +216,13 @@ retains the last image while searching for the next header.
 
 ## Implementation and limitations
 
-Encoding is precomputed outside JACK callbacks, in a worker for the GUI. Output
-callbacks only copy samples; input callbacks convert samples into a bounded,
-lock-free two-second ring buffer. A worker decodes rows using
+SSTV encoding is precomputed outside JACK callbacks, in a worker for the GUI.
+Its output callbacks only copy samples. NBTV output callbacks perform a simple
+allocation-free raster lookup into prepared grayscale frames. Input callbacks
+transfer samples into bounded, lock-free two-second ring buffers.
+A worker decodes SSTV rows using
 [`sstv`](https://github.com/unexcellent/sstv); the main thread displays them
-with minifb. The encoder GUI uses egui/eframe with an OpenGL renderer. Protocol
+using egui/eframe with an OpenGL renderer, as does the encoder GUI. Protocol
 changes transfer prepared audio through bounded lock-free queues; old audio is
 freed outside the JACK callback. Audio is never routed to speakers automatically.
 
@@ -140,9 +232,11 @@ lost audio may damage the current image. No samples are silently resampled.
 Clean reception is still lossy because of SSTV's resolution, chroma sampling,
 and frequency demodulation.
 
-This version does not handle MP4, provide an
-effects UI, or guarantee recovery within a severely corrupted transmission.
-The receiver searches for the next transmission after completing a decode.
+The SSTV applications do not handle MP4; use the separate NBTV applications for
+moving video. Neither format provides an effects UI. The SSTV receiver searches
+for the next transmission after completing a decode, or immediately on Reset.
+NBTV uses frame-by-frame synchronization but cannot guarantee recovery under
+severe signal corruption.
 
 ## Development
 
@@ -152,6 +246,16 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Unit and round-trip tests run without a JACK server or display. Actual JACK
+Unit and round-trip tests run without a JACK server or display; the MP4 ingestion
+tests require FFmpeg on `PATH`. Actual JACK
 routing, audio timing, and desktop rendering must also be exercised on the
 target Linux system.
+
+An opt-in NBTV JACK integration test checks decoding and transport start/stop.
+Run it only with an isolated dummy server, not your working audio session:
+
+```sh
+jackd --no-realtime --name sstv-rust-nbtv-test -d dummy -r 48000 -p 1024
+# In another terminal:
+JACK_DEFAULT_SERVER=sstv-rust-nbtv-test cargo test --test nbtv_jack -- --ignored
+```

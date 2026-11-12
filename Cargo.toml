@@ -3,7 +3,7 @@ name = "sstv-jack"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Still-image SSTV transmission and progressive reception over JACK"
+description = "SSTV still-image and NBTV moving-video transmission and reception over JACK"
 license = "MIT"
 
 [dependencies]
@@ -13,7 +13,6 @@ ctrlc = "3"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jack = "0.14"
-minifb = "0.29"
 rtrb = "0.4"
 sstv = { version = "0.3.1", features = ["image"] }
 
@@ -24,6 +23,14 @@ path = "src/bin/encoder.rs"
 [[bin]]
 name = "sstv-decoder"
 path = "src/bin/decoder.rs"
+
+[[bin]]
+name = "nbtv-encoder"
+path = "src/bin/nbtv-encoder.rs"
+
+[[bin]]
+name = "nbtv-decoder"
+path = "src/bin/nbtv-decoder.rs"
 
 [profile.test]
 opt-level = 1

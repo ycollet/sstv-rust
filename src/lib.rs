@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use rtrb::Consumer;
 
+pub mod nbtv;
 pub mod transmit;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -83,11 +84,28 @@ impl jack::NotificationHandler for Notifications {
 pub struct LiveSamples {
     consumer: Consumer<i16>,
     state: Arc<RunState>,
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl LiveSamples {
     pub fn new(consumer: Consumer<i16>, state: Arc<RunState>) -> Self {
-        Self { consumer, state }
+        Self {
+            consumer,
+            state,
+            interrupt: None,
+        }
+    }
+
+    pub fn with_interrupt(mut self, interrupt: Arc<AtomicBool>) -> Self {
+        self.interrupt = Some(interrupt);
+        self
+    }
+
+    pub fn discard_buffered(&mut self) {
+        let buffered = self.consumer.slots();
+        for _ in 0..buffered {
+            let _ = self.consumer.pop();
+        }
     }
 }
 
@@ -96,6 +114,13 @@ impl Iterator for LiveSamples {
 
     fn next(&mut self) -> Option<i16> {
         while self.state.is_running() {
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|interrupt| interrupt.load(Ordering::Acquire))
+            {
+                return None;
+            }
             if let Ok(sample) = self.consumer.pop() {
                 return Some(sample);
             }
@@ -112,33 +137,56 @@ pub fn pcm_sample(sample: f32) -> i16 {
 /// Precomputed audio keeps synthesis and allocation out of the JACK callback.
 #[derive(Debug)]
 pub struct Playback {
-    samples: Vec<f32>,
+    content: PlaybackContent,
     position: usize,
     repeat: bool,
+}
+
+#[derive(Debug)]
+enum PlaybackContent {
+    Pcm(Vec<f32>),
+    Nbtv {
+        clip: Arc<nbtv::Clip>,
+        sample_rate: u32,
+    },
 }
 
 impl Playback {
     pub fn new(samples: Vec<f32>, repeat: bool) -> Self {
         assert!(!samples.is_empty());
         Self {
-            samples,
+            content: PlaybackContent::Pcm(samples),
             position: 0,
             repeat,
         }
     }
 
+    pub fn nbtv(clip: Arc<nbtv::Clip>, sample_rate: u32) -> Self {
+        Self {
+            content: PlaybackContent::Nbtv { clip, sample_rate },
+            position: 0,
+            repeat: false,
+        }
+    }
+
     /// Returns true only after the final sample has left a previous callback.
     pub fn fill(&mut self, output: &mut [f32]) -> bool {
-        if !self.repeat && self.position == self.samples.len() {
+        let length = self.len();
+        if !self.repeat && self.position == length {
             output.fill(0.0);
             return true;
         }
         for sample in output {
-            if self.position == self.samples.len() && self.repeat {
+            if self.position == length && self.repeat {
                 self.position = 0;
             }
-            if let Some(value) = self.samples.get(self.position) {
-                *sample = *value;
+            if self.position < length {
+                *sample = match &self.content {
+                    PlaybackContent::Pcm(samples) => samples[self.position],
+                    PlaybackContent::Nbtv { clip, sample_rate } => {
+                        clip.sample(self.position, *sample_rate)
+                    }
+                };
                 self.position += 1;
             } else {
                 *sample = 0.0;
@@ -160,11 +208,14 @@ impl Playback {
     }
 
     pub fn len(&self) -> usize {
-        self.samples.len()
+        match &self.content {
+            PlaybackContent::Pcm(samples) => samples.len(),
+            PlaybackContent::Nbtv { clip, sample_rate } => clip.samples(*sample_rate),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
+        self.len() == 0
     }
 }
 
@@ -217,5 +268,19 @@ mod tests {
         assert_eq!(pcm_sample(2.0), i16::MAX);
         assert_eq!(pcm_sample(-2.0), -i16::MAX);
         assert_eq!(pcm_sample(0.0), 0);
+    }
+
+    #[test]
+    fn interrupted_live_samples_discard_old_audio_before_resuming() {
+        let state = RunState::new();
+        let interrupt = Arc::new(AtomicBool::new(true));
+        let (mut producer, consumer) = rtrb::RingBuffer::new(8);
+        producer.push(123).unwrap();
+        let mut samples = LiveSamples::new(consumer, state).with_interrupt(Arc::clone(&interrupt));
+        assert_eq!(samples.next(), None);
+        samples.discard_buffered();
+        producer.push(456).unwrap();
+        interrupt.store(false, Ordering::Release);
+        assert_eq!(samples.next(), Some(456));
     }
 }

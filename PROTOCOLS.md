@@ -9,6 +9,10 @@ The encoder's **Protocol** selector chooses the transmitted mode. The decoder
 automatically identifies it from the VIS header; it has no manual mode selector.
 Every mode transmits a still image, not a conventional moving-video stream.
 
+For moving video, the separate `nbtv-encoder` and `nbtv-decoder` applications
+implement monochrome NBTV Club 32-line at 12.5 fps, not an SSTV mode.
+See [NBTV operation and signal format](README.md#nbtv-moving-video-and-still-images).
+
 ## Common signal format
 
 SSTV represents image component values as the instantaneous frequency of a

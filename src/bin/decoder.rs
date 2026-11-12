@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use minifb::{Key, Scale, Window, WindowOptions};
+use eframe::egui;
 use sstv::Decoder;
 use sstv_jack::{LiveSamples, Notifications, RunState, pcm_sample};
 
@@ -38,7 +38,7 @@ impl Display {
             width: 320,
             height: 240,
             pixels: vec![0; 320 * 240],
-            title: "SSTV - waiting for a transmission (Esc to exit)".into(),
+            title: "SSTV - waiting for a transmission".into(),
         }
     }
 }
@@ -49,16 +49,23 @@ fn receive(
     state: &RunState,
     display: &Mutex<Display>,
     output: Option<PathBuf>,
+    reset: &AtomicBool,
 ) -> Result<()> {
     let mut samples = samples;
-    while state.is_running() {
-        let Some(rows) = Decoder::new(samples.by_ref(), sample_rate).rows() else {
+    while state.is_running() && !reset.load(Ordering::Acquire) {
+        let input = samples
+            .by_ref()
+            .take_while(|_| !reset.load(Ordering::Acquire));
+        let Some(rows) = Decoder::new(input, sample_rate).rows() else {
             break;
         };
+        if reset.load(Ordering::Acquire) {
+            break;
+        }
         let mode = rows.mode();
         let (width, height) = mode.resolution();
         let (width, height) = (width as usize, height as usize);
-        eprintln!("Receiving {width}x{height} SSTV image.");
+        eprintln!("Receiving {mode:?} ({width}x{height}) SSTV image.");
         {
             let mut frame = display
                 .lock()
@@ -66,10 +73,13 @@ fn receive(
             frame.width = width;
             frame.height = height;
             frame.pixels = vec![0; width * height];
-            frame.title = format!("SSTV - receiving {width}x{height}");
+            frame.title = format!("SSTV - {mode:?} - receiving {width}x{height}");
         }
         let mut received = 0;
         for row in rows {
+            if reset.load(Ordering::Acquire) {
+                break;
+            }
             let mut frame = display
                 .lock()
                 .map_err(|_| anyhow!("Display lock poisoned"))?;
@@ -83,9 +93,9 @@ fn receive(
                     | u32::from(pixel.blue());
             }
             received += 1;
-            frame.title = format!("SSTV - {width}x{height} - row {received}/{height}");
+            frame.title = format!("SSTV - {mode:?} - {width}x{height} - row {received}/{height}");
         }
-        if !state.is_running() {
+        if !state.is_running() || reset.load(Ordering::Acquire) {
             break;
         }
         if received != height {
@@ -96,7 +106,8 @@ fn receive(
             let mut frame = display
                 .lock()
                 .map_err(|_| anyhow!("Display lock poisoned"))?;
-            frame.title = format!("SSTV - {width}x{height} complete - listening for next image");
+            frame.title =
+                format!("SSTV - {mode:?} - {width}x{height} complete - listening for next image");
             output.as_ref().map(|_| {
                 image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
                     let pixel = frame.pixels[y as usize * width + x as usize];
@@ -114,22 +125,125 @@ fn receive(
     Ok(())
 }
 
+fn receive_live(
+    mut samples: LiveSamples,
+    sample_rate: u32,
+    state: &RunState,
+    display: &Mutex<Display>,
+    output: Option<PathBuf>,
+    reset: &AtomicBool,
+) -> Result<()> {
+    while state.is_running() {
+        if reset.load(Ordering::Acquire) {
+            samples.discard_buffered();
+            *display
+                .lock()
+                .map_err(|_| anyhow!("Display lock poisoned"))? = Display::waiting();
+            reset.store(false, Ordering::Release);
+            eprintln!("Decoder reset. Listening for a new transmission header.");
+        }
+        receive(
+            samples.by_ref(),
+            sample_rate,
+            state,
+            display,
+            output.clone(),
+            reset,
+        )?;
+        if !reset.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+struct DecoderApp {
+    display: Arc<Mutex<Display>>,
+    state: Arc<RunState>,
+    reset: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+    worker_finished: Arc<AtomicBool>,
+    texture: Option<egui::TextureHandle>,
+    last_dropped: usize,
+    last_xruns: usize,
+}
+
+impl eframe::App for DecoderApp {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if !self.state.is_running()
+            || self.worker_finished.load(Ordering::Acquire)
+            || ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        let frame = match self.display.lock() {
+            Ok(frame) => frame,
+            Err(_) => {
+                eprintln!("Display lock poisoned");
+                self.state.stop();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(frame.title.clone()));
+        let rgb: Vec<u8> = frame
+            .pixels
+            .iter()
+            .flat_map(|pixel| [(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8])
+            .collect();
+        let image = egui::ColorImage::from_rgb([frame.width, frame.height], &rgb);
+        drop(frame);
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, egui::TextureOptions::NEAREST);
+        } else {
+            self.texture =
+                Some(ctx.load_texture("reception", image, egui::TextureOptions::NEAREST));
+        }
+        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let resetting = self.reset.load(Ordering::Acquire);
+                if ui
+                    .add_enabled(!resetting, egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    self.reset.store(true, Ordering::Release);
+                }
+                ui.label(if resetting {
+                    "Resetting reception..."
+                } else {
+                    "Reset before starting a new transmission to detect its protocol."
+                });
+            });
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(texture) = &self.texture {
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(ui.available_size())
+                        .maintain_aspect_ratio(true),
+                );
+            }
+        });
+        let missed = self.dropped.load(Ordering::Relaxed);
+        if missed != self.last_dropped {
+            eprintln!(
+                "Warning: input buffer overflow, {missed} samples lost; image may be damaged."
+            );
+            self.last_dropped = missed;
+        }
+        let xruns = self.state.xruns.load(Ordering::Relaxed);
+        if xruns != self.last_xruns {
+            eprintln!("Warning: JACK xrun count {xruns}; image may be damaged.");
+            self.last_xruns = xruns;
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let state = RunState::new();
     state.install_interrupt_handler()?;
-    let mut window = Window::new(
-        "SSTV - waiting for a transmission",
-        320,
-        240,
-        WindowOptions {
-            resize: true,
-            scale: Scale::X2,
-            ..WindowOptions::default()
-        },
-    )
-    .context("Cannot open display window; a graphical desktop is required")?;
-    window.set_target_fps(30);
     let (client, _) = jack::Client::new(&args.name, jack::ClientOptions::NO_START_SERVER)
         .context("Cannot connect to JACK; start a JACK server or use pw-jack")?;
     let sample_rate = client.sample_rate();
@@ -172,54 +286,43 @@ fn main() -> Result<()> {
     let display = Arc::new(Mutex::new(Display::waiting()));
     let worker_display = Arc::clone(&display);
     let worker_state = Arc::clone(&state);
-    let samples = LiveSamples::new(consumer, Arc::clone(&state));
+    let reset = Arc::new(AtomicBool::new(false));
+    let worker_reset = Arc::clone(&reset);
+    let worker_finished = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&worker_finished);
+    let samples = LiveSamples::new(consumer, Arc::clone(&state)).with_interrupt(Arc::clone(&reset));
     let worker = std::thread::spawn(move || {
-        receive(
+        let result = receive_live(
             samples,
             sample_rate,
             &worker_state,
             &worker_display,
             args.output,
-        )
+            &worker_reset,
+        );
+        finished.store(true, Ordering::Release);
+        result
     });
 
-    let result = (|| -> Result<()> {
-        let mut last_dropped = 0;
-        let mut last_xruns = 0;
-        while window.is_open()
-            && !window.is_key_down(Key::Escape)
-            && state.is_running()
-            && !worker.is_finished()
-        {
-            let (pixels, width, height, title) = {
-                let frame = display
-                    .lock()
-                    .map_err(|_| anyhow!("Display lock poisoned"))?;
-                (
-                    frame.pixels.clone(),
-                    frame.width,
-                    frame.height,
-                    frame.title.clone(),
-                )
-            };
-            window.set_title(&title);
-            window.update_with_buffer(&pixels, width, height)?;
-            let missed = dropped.load(Ordering::Relaxed);
-            if missed != last_dropped {
-                eprintln!(
-                    "Warning: input buffer overflow, {missed} samples lost; image may be damaged."
-                );
-                last_dropped = missed;
-            }
-            let xruns = state.xruns.load(Ordering::Relaxed);
-            if xruns != last_xruns {
-                eprintln!("Warning: JACK xrun count {xruns}; image may be damaged.");
-                last_xruns = xruns;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
-    })();
+    let app = DecoderApp {
+        display,
+        state: Arc::clone(&state),
+        reset,
+        dropped,
+        worker_finished,
+        texture: None,
+        last_dropped: 0,
+        last_xruns: 0,
+    };
+    let result = eframe::run_native(
+        "SSTV - waiting for a transmission",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 560.0]),
+            ..Default::default()
+        },
+        Box::new(move |_| Ok(Box::new(app))),
+    )
+    .map_err(|error| anyhow!("Cannot run decoder GUI: {error}"));
     state.stop();
     let worker_result = worker
         .join()
@@ -236,6 +339,82 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use sstv::{Encoder, RgbPixel, Synthesizer, modes::ROBOT_36};
+
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[test]
+    fn reset_interrupts_idle_and_partial_reception_then_detects_a_new_protocol() {
+        let state = RunState::new();
+        let reset = Arc::new(AtomicBool::new(false));
+        let display = Arc::new(Mutex::new(Display::waiting()));
+        let (mut producer, consumer) = rtrb::RingBuffer::new(4_000_000);
+        let samples =
+            LiveSamples::new(consumer, Arc::clone(&state)).with_interrupt(Arc::clone(&reset));
+        let worker_state = Arc::clone(&state);
+        let worker_reset = Arc::clone(&reset);
+        let worker_display = Arc::clone(&display);
+        let worker = std::thread::spawn(move || {
+            receive_live(
+                samples,
+                48_000,
+                &worker_state,
+                &worker_display,
+                None,
+                &worker_reset,
+            )
+        });
+
+        reset.store(true, Ordering::Release);
+        let idle_reset = wait_until(|| !reset.load(Ordering::Acquire));
+        for sample in transmission(false, 48_000).into_iter().take(4 * 48_000) {
+            producer.push(sample).unwrap();
+        }
+        let first_detected = wait_until(|| display.lock().unwrap().title.contains("Robot36"));
+        // Let the partial image run out of queued samples, leaving next() blocked.
+        let input_consumed = wait_until(|| producer.slots() == 4_000_000);
+        reset.store(true, Ordering::Release);
+        let partial_reset = wait_until(|| !reset.load(Ordering::Acquire));
+        let cleared = {
+            let frame = display.lock().unwrap();
+            frame.title.contains("waiting") && frame.pixels.iter().all(|&pixel| pixel == 0)
+        };
+        let encoder = Encoder::new(
+            sstv::modes::MARTIN_2,
+            std::iter::repeat_n(RgbPixel::new(100, 150, 200), 320 * 256),
+        )
+        .unwrap();
+        for sample in Synthesizer::new(encoder, 48_000).chain(std::iter::repeat_n(0, 96_000)) {
+            producer.push(sample).unwrap();
+        }
+        let next_complete = wait_until(|| {
+            let frame = display.lock().unwrap();
+            frame.title.contains("Martin2") && frame.title.contains("complete")
+        });
+        state.stop();
+        worker.join().unwrap().unwrap();
+        assert!(idle_reset, "Reset did not interrupt header search");
+        assert!(
+            first_detected && input_consumed,
+            "Partial Robot36 was not received"
+        );
+        assert!(
+            partial_reset && cleared,
+            "Reset did not cancel and clear the partial image"
+        );
+        assert!(
+            next_complete,
+            "New protocol was not detected after resetting"
+        );
+    }
 
     fn transmission(inverted: bool, sample_rate: u32) -> Vec<i16> {
         let pixels = (0..240).flat_map(move |y| {
@@ -261,10 +440,19 @@ mod tests {
             .chain(transmission(true, sample_rate));
         let state = RunState::new();
         let display = Mutex::new(Display::waiting());
-        receive(samples, sample_rate, &state, &display, None).unwrap();
+        receive(
+            samples,
+            sample_rate,
+            &state,
+            &display,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let frame = display.lock().unwrap();
         assert_eq!((frame.width, frame.height), (320, 240));
         assert!(frame.title.contains("complete"));
+        assert!(frame.title.contains("Robot36"));
         let error: f64 = frame
             .pixels
             .iter()
@@ -292,6 +480,7 @@ mod tests {
             &state,
             &display,
             None,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert!(display.lock().unwrap().title.contains("waiting"));
