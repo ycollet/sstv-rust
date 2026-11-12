@@ -10,6 +10,9 @@ nbtv-encoder:output -> [optional JACK audio effects] -> nbtv-decoder:input
 
 The two formats are separate: an SSTV decoder cannot receive NBTV, or vice versa.
 
+The [examples directory](examples/README.md) contains a NASA still image and a
+small 10-second NASA video excerpt, with source credits and reuse terms.
+
 The encoder transmits a PNG or JPEG using a selectable SSTV protocol (Robot 36
 by default). The receiver
 detects the SSTV mode from its header and displays decoded rows progressively.
