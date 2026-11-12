@@ -7,6 +7,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use rtrb::Consumer;
 
+pub mod transmit;
+
 pub const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 pub struct RunState {
@@ -108,6 +110,7 @@ pub fn pcm_sample(sample: f32) -> i16 {
 }
 
 /// Precomputed audio keeps synthesis and allocation out of the JACK callback.
+#[derive(Debug)]
 pub struct Playback {
     samples: Vec<f32>,
     position: usize,
@@ -142,6 +145,26 @@ impl Playback {
             }
         }
         false
+    }
+
+    pub fn restart(&mut self) {
+        self.position = 0;
+    }
+
+    pub fn set_repeat(&mut self, repeat: bool) {
+        self.repeat = repeat;
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 }
 
