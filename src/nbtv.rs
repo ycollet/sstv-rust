@@ -17,6 +17,65 @@ pub const DEFAULT_THRESHOLD: f32 = -0.12;
 const SYNC_SECONDS: f64 = 0.0002;
 const PORCH_SECONDS: f64 = 0.00005;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    #[default]
+    Classic,
+    SeparateSync,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic (embedded sync)",
+            Self::SeparateSync => "Separate sync (custom)",
+        }
+    }
+
+    pub fn from_separate(separate: bool) -> Self {
+        if separate {
+            Self::SeparateSync
+        } else {
+            Self::Classic
+        }
+    }
+}
+
+pub fn sync_sample(position: usize, sample_rate: u32) -> f32 {
+    let line_position = position as f64 * LINE_RATE / f64::from(sample_rate);
+    if !(line_position.floor() as usize).is_multiple_of(WIDTH)
+        && line_position.fract() / LINE_RATE < SYNC_SECONDS
+    {
+        SYNC_LEVEL
+    } else {
+        0.0
+    }
+}
+
+pub struct SyncDelay {
+    samples: Vec<f32>,
+    position: usize,
+}
+
+impl SyncDelay {
+    pub fn new(samples: usize) -> Self {
+        Self {
+            samples: vec![0.0; samples],
+            position: 0,
+        }
+    }
+
+    pub fn push(&mut self, sample: f32) -> f32 {
+        if self.samples.is_empty() {
+            return sample;
+        }
+        let delayed = self.samples[self.position];
+        self.samples[self.position] = sample;
+        self.position = (self.position + 1) % self.samples.len();
+        delayed
+    }
+}
+
 #[derive(Debug)]
 pub struct Clip {
     pixels: Vec<u8>,
@@ -119,13 +178,17 @@ impl Decoder {
     }
 
     pub fn push(&mut self, sample: f32, threshold: f32) -> Option<Vec<u8>> {
-        self.history.push_back(sample);
+        self.push_channels(sample, sample, threshold)
+    }
+
+    pub fn push_channels(&mut self, picture: f32, sync: f32, threshold: f32) -> Option<Vec<u8>> {
+        self.history.push_back(picture);
         let period = f64::from(self.sample_rate) / LINE_RATE;
         while self.history.len() > (period * 3.0).ceil() as usize + 32 {
             self.history.pop_front();
         }
         let mut frame = None;
-        if sample < threshold {
+        if sync < threshold {
             if self.pulse_start.is_none() {
                 self.pulse_start = Some(self.position);
             }
@@ -276,5 +339,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn clean_separate_sync_locks_even_when_the_entire_picture_is_below_sync_threshold() {
+        let clip = chart(5);
+        for sample_rate in [44_100, 48_000] {
+            let mut separate = Decoder::new(sample_rate).unwrap();
+            let mut embedded = Decoder::new(sample_rate).unwrap();
+            let mut frames = 0;
+            for position in 0..clip.samples(sample_rate) {
+                let picture = clip.sample(position, sample_rate).max(0.0) * 0.1 - 0.8;
+                let sync = sync_sample(position, sample_rate);
+                assert!(embedded.push(picture, DEFAULT_THRESHOLD).is_none());
+                if let Some(frame) = separate.push_channels(picture, sync, DEFAULT_THRESHOLD) {
+                    frames += 1;
+                    assert!(frame.iter().all(|pixel| *pixel == 0));
+                }
+            }
+            assert!(frames >= 3);
+            assert!(separate.locked());
+            assert!(!embedded.locked());
+        }
+    }
+
+    #[test]
+    fn matching_sync_delay_preserves_the_delayed_picture_and_missing_sync_loses_lock() {
+        let clip = chart(6);
+        let rate = 48_000;
+        let mut picture_delay = SyncDelay::new(737);
+        let mut sync_delay = SyncDelay::new(737);
+        let mut baseline = Decoder::new(rate).unwrap();
+        let mut delayed = Decoder::new(rate).unwrap();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        for position in 0..clip.samples(rate) + 737 {
+            let (picture, sync) = if position < clip.samples(rate) {
+                (
+                    clip.sample(position, rate).max(0.0),
+                    sync_sample(position, rate),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            if let Some(frame) = baseline.push_channels(picture, sync, DEFAULT_THRESHOLD) {
+                expected.push(frame);
+            }
+            if let Some(frame) = delayed.push_channels(
+                picture_delay.push(picture),
+                sync_delay.push(sync),
+                DEFAULT_THRESHOLD,
+            ) {
+                actual.push(frame);
+            }
+        }
+        assert!(actual.len() >= 4);
+        assert_eq!(actual, expected);
+        for _ in 0..4800 {
+            assert!(
+                delayed
+                    .push_channels(-1.0, 0.0, DEFAULT_THRESHOLD)
+                    .is_none()
+            );
+        }
+        assert!(!delayed.locked());
     }
 }

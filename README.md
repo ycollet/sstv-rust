@@ -51,8 +51,10 @@ Start the receiver, then the encoder in a second terminal:
 In the encoder window, press **Play**. **Stop**, **Repeat**, and opt-in
 **Follow JACK transport** work like the SSTV encoder's controls: starting
 transport restarts the clip, stopping cancels it, and local buttons never change
-global transport. NBTV supports one fixed format: **Club 32-line monochrome at
-12.5 frames per second**. There is no protocol negotiation or selector.
+global transport. NBTV uses a **32-line monochrome raster at 12.5 frames per
+second**. Both windows offer **Classic (embedded sync)**, the default club
+format, and **Separate sync (custom)** for effects experiments. Select the same
+mode in both applications; there is no automatic negotiation.
 
 PNG/JPEG input also works:
 
@@ -78,7 +80,7 @@ The encoder also supports `--headless`, `--repeat`, `--follow-transport`,
 when connected and exits at the end of the clip unless Repeat is enabled.
 
 The decoder title shows the format and synchronization status. It searches for
-embedded frame synchronization continuously, including after signal loss;
+frame synchronization continuously, including after signal loss;
 **Reset** clears reception and discards buffered input without reconnecting JACK.
 Initial acquisition normally needs roughly two frames (160 ms); this is not a
 guaranteed end-to-end latency. The first and last source frames may not be
@@ -86,13 +88,50 @@ displayed while acquiring sync or waiting for the next boundary.
 `--output latest.png` saves each completed frame, overwriting that path at video
 rate. Esc, Ctrl-C, or closing the window exits.
 
+### Separate-sync mode for effects
+
+This custom mode keeps the same resolution, scan order, levels, and frame rate,
+but separates the picture from synchronization:
+
+```text
+nbtv-encoder:output -> [JACK effects] -> nbtv-decoder:input
+nbtv-encoder:sync   -----------------> nbtv-decoder:sync
+```
+
+Keep the sync path clean. Picture effects can then distort brightness without
+destroying synchronization, even when the picture falls below the sync threshold.
+The picture output replaces negative sync pulses with black; the sync output
+carries the classic missing-pulse pattern independently of picture content.
+The extra `sync` ports are always present but the encoder's sync output is silent
+in Classic mode. This is not a standardized NBTV format and requires a receiver
+configured for separate sync; it does not add resolution or color.
+
+For a direct connection without effects:
+
+```sh
+./target/release/nbtv-decoder --mode separate-sync
+./target/release/nbtv-encoder movie.mp4 --mode separate-sync \
+    --connect nbtv-decoder:input --connect-sync nbtv-decoder:sync
+```
+
+For effects, connect `output` to the effect input instead, and its output to the
+decoder's `input`. The decoder's **Sync delay** control delays the clean sync
+by **0–2000 ms** to match latency in the picture path; fractional milliseconds
+are supported, rounded to the nearest audio sample. For example,
+`--sync-delay-ms 25` compensates for a picture delayed by 25 ms. It cannot
+simultaneously align multiple dry/wet echoes or compensate changing delay.
+The control is ignored in Classic mode. Changing decoder mode or delay resets
+reception and clears buffered signal/delay history. Encoder mode changes are
+available while stopped. Manual playback requires both output connections in
+Separate sync mode; transport following still starts without waiting for wiring.
+
 ### NBTV effects and compatibility
 
 Route the NBTV ports through effects using the same JACK patchbay workflow as
 SSTV. Do not mix the SSTV and NBTV signals. NBTV encodes brightness as amplitude:
 gain, clipping, filtering, and delay affect the picture directly.
 
-The format follows the [NBTV Association club standard](https://www.nbtv.org.uk/standards.htm):
+Classic mode follows the [NBTV Association club standard](https://www.nbtv.org.uk/standards.htm):
 32 vertical scans, bottom to top and right to left, at 400 lines per second.
 The encoder uses 200 microsecond negative sync pulses; the pulse between line
 32 and line 1 is omitted and replaced with black to identify each frame.
@@ -106,7 +145,8 @@ run at 32 kHz or higher; 44.1/48 kHz are suitable.
 
 The receiver's **Sync threshold** slider (also `--threshold`, default `-0.12`)
 can compensate for moderate level changes. Sync must fall below the threshold
-and black/active video must stay above it. Changing the slider resets reception.
+and, in Classic mode, black/active video must stay above it. In Separate sync
+mode the threshold applies only to the clean sync input. Changing the slider resets reception.
 There is no automatic gain control, DC restoration, or polarity detection;
 external recordings/hardware and AC-coupled effects may need level, offset, and
 polarity adjustment. External hardware interoperability has not been verified.
@@ -251,7 +291,8 @@ tests require FFmpeg on `PATH`. Actual JACK
 routing, audio timing, and desktop rendering must also be exercised on the
 target Linux system.
 
-An opt-in NBTV JACK integration test checks decoding and transport start/stop.
+An opt-in NBTV JACK integration test checks both modes and transport start/stop,
+including heavy picture distortion with clean separate sync.
 Run it only with an isolated dummy server, not your working audio session:
 
 ```sh

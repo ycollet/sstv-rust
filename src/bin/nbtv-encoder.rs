@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -8,12 +11,12 @@ use clap::Parser;
 use eframe::egui;
 use sstv_jack::{
     Notifications, Playback, RunState,
-    nbtv::{self, FPS},
+    nbtv::{self, FPS, Mode},
     transmit::{AudioExchange, Controls, Transmitter},
 };
 
 #[derive(Parser)]
-#[command(about = "Transmit MP4 video or a PNG/JPEG as classic 32-line monochrome NBTV over JACK")]
+#[command(about = "Transmit MP4 video or a PNG/JPEG as 32-line monochrome NBTV over JACK")]
 struct Args {
     /// MP4/video file (requires ffmpeg), or PNG/JPEG still image.
     input: PathBuf,
@@ -22,6 +25,12 @@ struct Args {
     /// Destination JACK input port.
     #[arg(long, value_name = "CLIENT:PORT")]
     connect: Option<String>,
+    /// Signal format; the custom mode requires a separate sync connection.
+    #[arg(long, value_enum, default_value_t = Mode::Classic)]
+    mode: Mode,
+    /// Destination for the clean sync output (used in separate-sync mode).
+    #[arg(long, value_name = "CLIENT:PORT")]
+    connect_sync: Option<String>,
     /// Loop the clip; a still image is a two-second clip.
     #[arg(long)]
     repeat: bool,
@@ -39,6 +48,8 @@ struct EncoderApp {
     exchange: AudioExchange,
     state: Arc<RunState>,
     monitor: jack::Port<jack::Unowned>,
+    sync_monitor: jack::Port<jack::Unowned>,
+    separate: Arc<AtomicBool>,
     loader: Option<JoinHandle<Result<Arc<nbtv::Clip>>>>,
     sample_rate: u32,
     frames: usize,
@@ -84,6 +95,17 @@ impl eframe::App for EncoderApp {
                 0
             }
         };
+        let sync_connections = match self.sync_monitor.connected_count() {
+            Ok(count) => count,
+            Err(error) => {
+                if self.error.is_none() {
+                    eprintln!("Cannot query JACK sync connections: {error}");
+                    self.error = Some(format!("Cannot query JACK sync connections: {error}"));
+                }
+                0
+            }
+        };
+        let mut mode = Mode::from_separate(self.separate.load(Ordering::Acquire));
         let ready = self.controls.ready.load(Ordering::Acquire);
         let playing = self.controls.playing.load(Ordering::Acquire);
         let mut repeat = self.controls.repeat.load(Ordering::Relaxed);
@@ -91,9 +113,23 @@ impl eframe::App for EncoderApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("NBTV encoder");
             ui.label(&self.path);
-            ui.label("NBTV Club 32-line | monochrome | 12.5 fps | embedded missing-pulse sync");
-            ui.label(format!("{} Hz | {connections} JACK output connection(s)", self.sample_rate));
+            ui.label("32-line monochrome | 12.5 fps");
+            ui.label(format!("{} Hz | picture: {connections} connection(s) | sync: {sync_connections}", self.sample_rate));
             ui.separator();
+            let previous = mode;
+            ui.add_enabled_ui(!playing, |ui| {
+                egui::ComboBox::from_label("Mode")
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in [Mode::Classic, Mode::SeparateSync] {
+                            ui.selectable_value(&mut mode, candidate, candidate.label());
+                        }
+                    });
+            });
+            if mode != previous {
+                self.controls.stop();
+                self.separate.store(mode == Mode::SeparateSync, Ordering::Release);
+            }
             ui.checkbox(&mut repeat, "Repeat");
             ui.add_enabled_ui(ready, |ui| {
                 ui.checkbox(&mut follow, "Follow JACK transport");
@@ -101,7 +137,7 @@ impl eframe::App for EncoderApp {
             self.controls.repeat.store(repeat, Ordering::Relaxed);
             self.controls.follow_transport.store(follow, Ordering::Release);
             ui.horizontal(|ui| {
-                if ui.add_enabled(ready && !playing && !follow && connections > 0, egui::Button::new("Play")).clicked() {
+                if ui.add_enabled(ready && !playing && !follow && connections > 0 && (mode == Mode::Classic || sync_connections > 0), egui::Button::new("Play")).clicked() {
                     self.controls.play();
                 }
                 if ui.add_enabled(playing, egui::Button::new("Stop")).clicked() {
@@ -123,6 +159,12 @@ impl eframe::App for EncoderApp {
             ui.label(format!("JACK transport: {} | xruns: {}", if self.controls.rolling.load(Ordering::Relaxed) { "rolling" } else { "stopped / starting" }, self.state.xruns.load(Ordering::Relaxed)));
             ui.small("Play/Stop are local. Transport start restarts the clip, not its timeline position.");
             ui.small("Portrait 32x48 grayscale; source audio is not transmitted.");
+            if mode == Mode::SeparateSync {
+                ui.small("Route output through effects; connect sync directly to the decoder's sync port.");
+                if sync_connections == 0 {
+                    ui.colored_label(egui::Color32::YELLOW, "No sync output connection.");
+                }
+            }
         });
         let xruns = self.state.xruns.load(Ordering::Relaxed);
         if xruns != self.last_xruns {
@@ -161,6 +203,10 @@ fn main() -> Result<()> {
     let mut output = client.register_port("output", jack::AudioOut::default())?;
     let port_name = output.name()?;
     let monitor = output.clone_unowned();
+    let mut sync_output = client.register_port("sync", jack::AudioOut::default())?;
+    let sync_port_name = sync_output.name()?;
+    let sync_monitor = sync_output.clone_unowned();
+    let separate = Arc::new(AtomicBool::new(args.mode == Mode::SeparateSync));
     let controls = Arc::new(Controls::default());
     controls.repeat.store(args.repeat, Ordering::Relaxed);
     controls
@@ -170,16 +216,24 @@ fn main() -> Result<()> {
     let callback_controls = Arc::clone(&controls);
     let callback_state = Arc::clone(&state);
     let transport = client.transport();
+    let callback_separate = Arc::clone(&separate);
     let process = jack::contrib::ClosureProcessHandler::new(
         move |_: &jack::Client, scope: &jack::ProcessScope| {
             let buffer = output.as_mut_slice(scope);
+            let sync_buffer = sync_output.as_mut_slice(scope);
             match transport.query_state() {
                 Ok(transport) => {
-                    transmitter.process(buffer, transport == jack::TransportState::Rolling);
+                    transmitter.process_with_sync(
+                        buffer,
+                        sync_buffer,
+                        transport == jack::TransportState::Rolling,
+                        callback_separate.load(Ordering::Acquire),
+                    );
                     jack::Control::Continue
                 }
                 Err(_) => {
                     buffer.fill(0.0);
+                    sync_buffer.fill(0.0);
                     callback_controls
                         .transport_failed
                         .store(true, Ordering::Relaxed);
@@ -196,12 +250,21 @@ fn main() -> Result<()> {
         },
         process,
     )?;
-    eprintln!("Output: {port_name} ({sample_rate} Hz, NBTV Club 32-line, 12.5 fps)");
+    eprintln!(
+        "Output: {port_name} | Sync: {sync_port_name} ({sample_rate} Hz, {}, 12.5 fps)",
+        args.mode.label()
+    );
     if let Some(destination) = &args.connect {
         active
             .as_client()
             .connect_ports_by_name(&port_name, destination)
             .with_context(|| format!("Cannot connect to {destination}"))?;
+    }
+    if let Some(destination) = &args.connect_sync {
+        active
+            .as_client()
+            .connect_ports_by_name(&sync_port_name, destination)
+            .with_context(|| format!("Cannot connect sync to {destination}"))?;
     }
     let result = (|| -> Result<()> {
         if args.headless {
@@ -223,6 +286,7 @@ fn main() -> Result<()> {
                     && !started
                     && controls.ready.load(Ordering::Acquire)
                     && monitor.connected_count()? > 0
+                    && (args.mode == Mode::Classic || sync_monitor.connected_count()? > 0)
                 {
                     controls.play();
                     started = true;
@@ -251,6 +315,8 @@ fn main() -> Result<()> {
                 exchange,
                 state: Arc::clone(&state),
                 monitor,
+                sync_monitor,
+                separate,
                 loader: Some(loader),
                 sample_rate,
                 frames: 0,
@@ -260,7 +326,7 @@ fn main() -> Result<()> {
             eframe::run_native(
                 "NBTV encoder",
                 eframe::NativeOptions {
-                    viewport: egui::ViewportBuilder::default().with_inner_size([680.0, 330.0]),
+                    viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 420.0]),
                     ..Default::default()
                 },
                 Box::new(move |_| Ok(Box::new(app))),

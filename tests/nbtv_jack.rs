@@ -20,6 +20,12 @@ fn jack_transport_routes_decodable_nbtv_and_stops_cleanly() {
         Ok("sstv-rust-nbtv-test"),
         "Do not run the transport test on a shared audio server"
     );
+    for separate in [false, true] {
+        run_transport_test(separate);
+    }
+}
+
+fn run_transport_test(separate: bool) {
     let (sender, _) = jack::Client::new("tx-nbtv", jack::ClientOptions::NO_START_SERVER).unwrap();
     let (receiver, _) = jack::Client::new("rx-nbtv", jack::ClientOptions::NO_START_SERVER).unwrap();
     let sample_rate = sender.sample_rate();
@@ -29,8 +35,16 @@ fn jack_transport_routes_decodable_nbtv_and_stops_cleanly() {
     let input = receiver
         .register_port("input", jack::AudioIn::default())
         .unwrap();
+    let mut sync_output = sender
+        .register_port("sync", jack::AudioOut::default())
+        .unwrap();
+    let sync_input = receiver
+        .register_port("sync", jack::AudioIn::default())
+        .unwrap();
     let source = output.name().unwrap();
     let destination = input.name().unwrap();
+    let sync_source = sync_output.name().unwrap();
+    let sync_destination = sync_input.name().unwrap();
     let controls = Arc::new(Controls::default());
     controls.follow_transport.store(true, Ordering::Release);
     controls.repeat.store(true, Ordering::Relaxed);
@@ -57,8 +71,10 @@ fn jack_transport_routes_decodable_nbtv_and_stops_cleanly() {
             (),
             jack::contrib::ClosureProcessHandler::new(
                 move |_: &jack::Client, scope: &jack::ProcessScope| {
-                    for &sample in input.as_slice(scope) {
-                        if producer.push(sample).is_err() {
+                    for (&picture, &sync) in
+                        input.as_slice(scope).iter().zip(sync_input.as_slice(scope))
+                    {
+                        if producer.push((picture, sync)).is_err() {
                             callback_overflows.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -68,15 +84,23 @@ fn jack_transport_routes_decodable_nbtv_and_stops_cleanly() {
         )
         .unwrap();
     let callback_transport = sender.transport();
+    let controls_for_effect = Arc::clone(&controls);
     let tx = sender
         .activate_async(
             (),
             jack::contrib::ClosureProcessHandler::new(
                 move |_: &jack::Client, scope: &jack::ProcessScope| {
-                    transmitter.process(
+                    transmitter.process_with_sync(
                         output.as_mut_slice(scope),
+                        sync_output.as_mut_slice(scope),
                         callback_transport.query_state().unwrap() == jack::TransportState::Rolling,
+                        separate,
                     );
+                    if separate && controls_for_effect.playing.load(Ordering::Acquire) {
+                        for sample in output.as_mut_slice(scope) {
+                            *sample = *sample * 0.1 - 0.8;
+                        }
+                    }
                     jack::Control::Continue
                 },
             ),
@@ -85,20 +109,31 @@ fn jack_transport_routes_decodable_nbtv_and_stops_cleanly() {
     tx.as_client()
         .connect_ports_by_name(&source, &destination)
         .unwrap();
+    tx.as_client()
+        .connect_ports_by_name(&sync_source, &sync_destination)
+        .unwrap();
     let mut decoder = nbtv::Decoder::new(sample_rate).unwrap();
     let mut drain_for = |duration| {
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline {
-            while let Ok(sample) = consumer.pop() {
-                if sample != 0.0 {
+            while let Ok((picture, sync)) = consumer.pop() {
+                if picture != 0.0 || sync != 0.0 {
                     signals.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(frame) = decoder.push(sample, nbtv::DEFAULT_THRESHOLD) {
-                    for row in frame.as_chunks::<32>().0 {
-                        assert!(
-                            row[0] < 5 && row[31] > 250,
-                            "Raster orientation/levels incorrect"
-                        );
+                if let Some(frame) = decoder.push_channels(
+                    picture,
+                    if separate { sync } else { picture },
+                    nbtv::DEFAULT_THRESHOLD,
+                ) {
+                    if separate {
+                        assert!(frame.iter().all(|pixel| *pixel == 0));
+                    } else {
+                        for row in frame.as_chunks::<32>().0 {
+                            assert!(
+                                row[0] < 5 && row[31] > 250,
+                                "Raster orientation/levels incorrect"
+                            );
+                        }
                     }
                     frames.fetch_add(1, Ordering::Relaxed);
                 }

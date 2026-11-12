@@ -11,19 +11,39 @@ use eframe::egui;
 use sstv_jack::{Notifications, POLL_INTERVAL, RunState, nbtv};
 
 #[derive(Parser)]
-#[command(about = "Receive classic 32-line monochrome NBTV video from a mono JACK port")]
+#[command(about = "Receive 32-line monochrome NBTV video over JACK")]
 struct Args {
     #[arg(long, default_value = "nbtv-decoder")]
     name: String,
     /// Source JACK output port.
     #[arg(long, value_name = "CLIENT:PORT")]
     connect: Option<String>,
+    /// Signal format; choose the same mode in the encoder.
+    #[arg(long, value_enum, default_value_t = nbtv::Mode::Classic)]
+    mode: nbtv::Mode,
+    /// Clean sync source for separate-sync mode.
+    #[arg(long, value_name = "CLIENT:PORT")]
+    connect_sync: Option<String>,
+    /// Delay clean sync to match picture-path latency (separate-sync only).
+    #[arg(long, default_value_t = 0.0, value_parser = sync_delay_ms)]
+    sync_delay_ms: f64,
     /// Save the latest complete frame as a PNG (overwritten at video rate).
     #[arg(long)]
     output: Option<PathBuf>,
     /// Synchronization threshold in JACK signal units; sync must be below it.
     #[arg(long, default_value_t = nbtv::DEFAULT_THRESHOLD, allow_hyphen_values = true, value_parser = threshold)]
     threshold: f32,
+}
+
+fn sync_delay_ms(value: &str) -> std::result::Result<f64, String> {
+    let value: f64 = value
+        .parse()
+        .map_err(|_| "Sync delay must be a number".to_string())?;
+    if value.is_finite() && (0.0..=2000.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("Sync delay must be between 0 and 2000 milliseconds".into())
+    }
 }
 
 fn threshold(value: &str) -> std::result::Result<f32, String> {
@@ -58,17 +78,25 @@ struct Shared {
     reception: Mutex<Reception>,
     reset: AtomicBool,
     threshold: AtomicU32,
+    separate: AtomicBool,
+    delay_samples: AtomicUsize,
     dropped: AtomicUsize,
     finished: AtomicBool,
 }
 
 fn receive(
-    mut consumer: rtrb::Consumer<f32>,
+    mut consumer: rtrb::Consumer<(f32, f32)>,
     shared: &Shared,
     sample_rate: u32,
     output: Option<PathBuf>,
 ) -> Result<()> {
     let mut decoder = nbtv::Decoder::new(sample_rate)?;
+    let mut separate = shared.separate.load(Ordering::Acquire);
+    let mut delay = nbtv::SyncDelay::new(if separate {
+        shared.delay_samples.load(Ordering::Relaxed)
+    } else {
+        0
+    });
     let mut until_status = 0;
     while shared.state.is_running() {
         if shared.reset.load(Ordering::Acquire) {
@@ -77,13 +105,19 @@ fn receive(
                 let _ = consumer.pop();
             }
             decoder = nbtv::Decoder::new(sample_rate)?;
+            separate = shared.separate.load(Ordering::Acquire);
+            delay = nbtv::SyncDelay::new(if separate {
+                shared.delay_samples.load(Ordering::Relaxed)
+            } else {
+                0
+            });
             *shared
                 .reception
                 .lock()
                 .map_err(|_| anyhow!("Reception lock poisoned"))? = Reception::new();
             shared.reset.store(false, Ordering::Release);
         }
-        let sample = match consumer.pop() {
+        let (picture, sync) = match consumer.pop() {
             Ok(sample) => sample,
             Err(_) => {
                 std::thread::sleep(POLL_INTERVAL);
@@ -91,7 +125,8 @@ fn receive(
             }
         };
         let threshold = f32::from_bits(shared.threshold.load(Ordering::Relaxed));
-        if let Some(pixels) = decoder.push(sample, threshold) {
+        let sync = if separate { delay.push(sync) } else { picture };
+        if let Some(pixels) = decoder.push_channels(picture, sync, threshold) {
             if let Some(path) = &output {
                 image::save_buffer(
                     path,
@@ -127,6 +162,7 @@ struct DecoderApp {
     texture: Option<egui::TextureHandle>,
     last_dropped: usize,
     last_xruns: usize,
+    sample_rate: u32,
 }
 
 impl eframe::App for DecoderApp {
@@ -146,7 +182,8 @@ impl eframe::App for DecoderApp {
             }
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "NBTV Club 32-line - 12.5 fps - {}",
+            "NBTV {} - 32-line - 12.5 fps - {}",
+            nbtv::Mode::from_separate(self.shared.separate.load(Ordering::Acquire)).label(),
             if locked {
                 "sync locked"
             } else {
@@ -160,6 +197,21 @@ impl eframe::App for DecoderApp {
             self.texture = Some(ctx.load_texture("nbtv", image, egui::TextureOptions::NEAREST));
         }
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            let mut mode = nbtv::Mode::from_separate(self.shared.separate.load(Ordering::Acquire));
+            let previous = mode;
+            egui::ComboBox::from_label("Mode")
+                .selected_text(mode.label())
+                .show_ui(ui, |ui| {
+                    for candidate in [nbtv::Mode::Classic, nbtv::Mode::SeparateSync] {
+                        ui.selectable_value(&mut mode, candidate, candidate.label());
+                    }
+                });
+            if mode != previous {
+                self.shared
+                    .separate
+                    .store(mode == nbtv::Mode::SeparateSync, Ordering::Release);
+                self.shared.reset.store(true, Ordering::Release);
+            }
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -182,7 +234,34 @@ impl eframe::App for DecoderApp {
                     .store(threshold.to_bits(), Ordering::Relaxed);
                 self.shared.reset.store(true, Ordering::Release);
             }
-            ui.small("NBTV has no protocol header. Sync is embedded in every frame.");
+            ui.add_enabled_ui(mode == nbtv::Mode::SeparateSync, |ui| {
+                let samples = self.shared.delay_samples.load(Ordering::Relaxed);
+                let mut delay_ms = samples as f64 * 1000.0 / f64::from(self.sample_rate);
+                ui.horizontal(|ui| {
+                    ui.label("Sync delay");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut delay_ms)
+                                .range(0.0..=2000.0)
+                                .speed(0.01)
+                                .max_decimals(3)
+                                .suffix(" ms"),
+                        )
+                        .changed()
+                    {
+                        self.shared.delay_samples.store(
+                            (delay_ms * f64::from(self.sample_rate) / 1000.0).round() as usize,
+                            Ordering::Relaxed,
+                        );
+                        self.shared.reset.store(true, Ordering::Release);
+                    }
+                });
+            });
+            ui.small(if mode == nbtv::Mode::Classic {
+                "Sync is embedded in the picture input."
+            } else {
+                "Route picture through effects; feed clean sync into the sync input."
+            });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(texture) = &self.texture {
@@ -217,12 +296,18 @@ fn main() -> Result<()> {
     nbtv::Decoder::new(sample_rate)?;
     let input = client.register_port("input", jack::AudioIn::default())?;
     let port_name = input.name()?;
+    let sync_input = client.register_port("sync", jack::AudioIn::default())?;
+    let sync_port_name = sync_input.name()?;
     let (mut producer, consumer) = rtrb::RingBuffer::new(2 * sample_rate as usize);
     let shared = Arc::new(Shared {
         state: Arc::clone(&state),
         reception: Mutex::new(Reception::new()),
         reset: AtomicBool::new(false),
         threshold: AtomicU32::new(args.threshold.to_bits()),
+        separate: AtomicBool::new(args.mode == nbtv::Mode::SeparateSync),
+        delay_samples: AtomicUsize::new(
+            (args.sync_delay_ms * f64::from(sample_rate) / 1000.0).round() as usize,
+        ),
         dropped: AtomicUsize::new(0),
         finished: AtomicBool::new(false),
     });
@@ -230,8 +315,8 @@ fn main() -> Result<()> {
     let process = jack::contrib::ClosureProcessHandler::new(
         move |_: &jack::Client, scope: &jack::ProcessScope| {
             let mut missed = 0;
-            for &sample in input.as_slice(scope) {
-                if producer.push(sample).is_err() {
+            for (&picture, &sync) in input.as_slice(scope).iter().zip(sync_input.as_slice(scope)) {
+                if producer.push((picture, sync)).is_err() {
                     missed += 1;
                 }
             }
@@ -248,12 +333,21 @@ fn main() -> Result<()> {
         },
         process,
     )?;
-    eprintln!("Input: {port_name} ({sample_rate} Hz, NBTV Club 32-line). Esc/Ctrl-C exits.");
+    eprintln!(
+        "Input: {port_name} | Sync: {sync_port_name} ({sample_rate} Hz, {}). Esc/Ctrl-C exits.",
+        args.mode.label()
+    );
     if let Some(source) = &args.connect {
         active
             .as_client()
             .connect_ports_by_name(source, &port_name)
             .with_context(|| format!("Cannot connect from {source}"))?;
+    }
+    if let Some(source) = &args.connect_sync {
+        active
+            .as_client()
+            .connect_ports_by_name(source, &sync_port_name)
+            .with_context(|| format!("Cannot connect sync from {source}"))?;
     }
     let worker_shared = Arc::clone(&shared);
     let worker = std::thread::spawn(move || {
@@ -266,6 +360,7 @@ fn main() -> Result<()> {
         texture: None,
         last_dropped: 0,
         last_xruns: 0,
+        sample_rate,
     };
     let result = eframe::run_native(
         "NBTV decoder",
@@ -303,13 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn live_receiver_resets_without_input_then_receives_a_new_clip() {
+    fn live_receiver_resets_without_input_and_switches_signal_modes() {
         let state = RunState::new();
         let shared = Arc::new(Shared {
             state: Arc::clone(&state),
             reception: Mutex::new(Reception::new()),
             reset: AtomicBool::new(false),
             threshold: AtomicU32::new(nbtv::DEFAULT_THRESHOLD.to_bits()),
+            separate: AtomicBool::new(false),
+            delay_samples: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
         });
@@ -318,25 +415,58 @@ mod tests {
         let worker = std::thread::spawn(move || receive(consumer, &worker_shared, 48_000, None));
         shared.reset.store(true, Ordering::Release);
         let idle_reset = wait_until(|| !shared.reset.load(Ordering::Acquire));
-        let feed = |producer: &mut rtrb::Producer<f32>, value| {
+        let feed = |producer: &mut rtrb::Producer<(f32, f32)>, value, separate| {
             let clip = nbtv::Clip::new(vec![value; nbtv::FRAME_PIXELS * 5]).unwrap();
             for position in 0..clip.samples(48_000) {
-                producer.push(clip.sample(position, 48_000)).unwrap();
+                let picture = clip.sample(position, 48_000);
+                producer
+                    .push(if separate {
+                        (
+                            picture.max(0.0) * 0.1 - 0.8,
+                            nbtv::sync_sample(position, 48_000),
+                        )
+                    } else {
+                        (picture, 0.0)
+                    })
+                    .unwrap();
             }
         };
-        feed(&mut producer, 200);
+        feed(&mut producer, 200, false);
         let first = wait_until(|| shared.reception.lock().unwrap().frames >= 3);
+        shared.separate.store(true, Ordering::Release);
+        shared.delay_samples.store(737, Ordering::Relaxed);
         shared.reset.store(true, Ordering::Release);
         let reset = wait_until(|| !shared.reset.load(Ordering::Acquire));
         let cleared = {
             let reception = shared.reception.lock().unwrap();
             reception.frames == 0 && reception.pixels.iter().all(|pixel| *pixel == 0)
         };
-        feed(&mut producer, 50);
+        feed(&mut producer, 50, true);
         let second = wait_until(|| shared.reception.lock().unwrap().frames >= 3);
+        let distorted = shared
+            .reception
+            .lock()
+            .unwrap()
+            .pixels
+            .iter()
+            .all(|pixel| *pixel == 0);
+        shared.separate.store(false, Ordering::Release);
+        shared.reset.store(true, Ordering::Release);
+        let classic_reset = wait_until(|| !shared.reset.load(Ordering::Acquire));
+        feed(&mut producer, 50, false);
+        let third = wait_until(|| shared.reception.lock().unwrap().frames >= 3);
         state.stop();
         worker.join().unwrap().unwrap();
-        assert!(idle_reset && first && reset && cleared && second);
+        assert!(
+            idle_reset
+                && first
+                && reset
+                && cleared
+                && second
+                && distorted
+                && classic_reset
+                && third
+        );
         assert!(
             shared
                 .reception

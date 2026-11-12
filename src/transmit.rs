@@ -79,6 +79,26 @@ impl Transmitter {
     }
 
     pub fn process(&mut self, output: &mut [f32], rolling: bool) {
+        self.process_channels(output, None, rolling, false);
+    }
+
+    pub fn process_with_sync(
+        &mut self,
+        output: &mut [f32],
+        sync: &mut [f32],
+        rolling: bool,
+        separate: bool,
+    ) {
+        self.process_channels(output, Some(sync), rolling, separate);
+    }
+
+    fn process_channels(
+        &mut self,
+        output: &mut [f32],
+        mut sync: Option<&mut [f32]>,
+        rolling: bool,
+        separate: bool,
+    ) {
         let mut loaded = false;
         // There is only one retirement producer. Reserve capacity before
         // replacing audio so no Vec is dropped on the process thread.
@@ -121,10 +141,20 @@ impl Transmitter {
             self.playing = false;
         }
         output.fill(0.0);
+        if let Some(sync) = &mut sync {
+            sync.fill(0.0);
+        }
         if let Some(playback) = &mut self.playback {
             playback.set_repeat(self.controls.repeat.load(Ordering::Relaxed));
-            if self.playing && playback.fill(output) {
-                self.playing = false;
+            if self.playing {
+                let finished = if let Some(sync) = sync {
+                    playback.fill_with_sync(output, sync, separate)
+                } else {
+                    playback.fill(output)
+                };
+                if finished {
+                    self.playing = false;
+                }
             }
             self.controls
                 .position
@@ -252,5 +282,46 @@ mod tests {
             .unwrap();
         transmitter.process(&mut output, true);
         assert_eq!(output, [0.4, 0.5]);
+    }
+
+    #[test]
+    fn paired_nbtv_outputs_share_the_clock_across_repeat_stop_and_replay() {
+        use crate::nbtv;
+        let controls = Arc::new(Controls::default());
+        let (mut transmitter, mut exchange) = Transmitter::new(Arc::clone(&controls));
+        let clip = Arc::new(nbtv::Clip::new(vec![128; nbtv::FRAME_PIXELS]).unwrap());
+        let length = clip.samples(44_100);
+        exchange
+            .pending
+            .push(Playback::nbtv(Arc::clone(&clip), 44_100))
+            .unwrap();
+        controls.repeat.store(true, Ordering::Relaxed);
+        controls.play();
+        let mut picture = [0.0; 257];
+        let mut sync = [0.0; 257];
+        for block in 0..40 {
+            transmitter.process_with_sync(&mut picture, &mut sync, false, true);
+            for index in 0..257 {
+                let position = (block * 257 + index) % length;
+                assert_eq!(picture[index], clip.sample(position, 44_100).max(0.0));
+                assert_eq!(sync[index], nbtv::sync_sample(position, 44_100));
+            }
+        }
+        controls.stop();
+        transmitter.process_with_sync(&mut picture, &mut sync, false, true);
+        assert_eq!(picture, [0.0; 257]);
+        assert_eq!(sync, [0.0; 257]);
+        controls.play();
+        transmitter.process_with_sync(&mut picture, &mut sync, false, true);
+        for index in 0..257 {
+            assert_eq!(picture[index], clip.sample(index, 44_100).max(0.0));
+            assert_eq!(sync[index], nbtv::sync_sample(index, 44_100));
+        }
+        controls.stop();
+        transmitter.process_with_sync(&mut picture, &mut sync, false, false);
+        controls.play();
+        transmitter.process_with_sync(&mut picture, &mut sync, false, false);
+        assert!(picture.iter().any(|sample| *sample < 0.0));
+        assert_eq!(sync, [0.0; 257]);
     }
 }

@@ -171,12 +171,29 @@ impl Playback {
 
     /// Returns true only after the final sample has left a previous callback.
     pub fn fill(&mut self, output: &mut [f32]) -> bool {
+        self.fill_channels(output, None, false)
+    }
+
+    pub fn fill_with_sync(&mut self, output: &mut [f32], sync: &mut [f32], separate: bool) -> bool {
+        assert_eq!(output.len(), sync.len());
+        self.fill_channels(output, Some(sync), separate)
+    }
+
+    fn fill_channels(
+        &mut self,
+        output: &mut [f32],
+        mut sync: Option<&mut [f32]>,
+        separate: bool,
+    ) -> bool {
+        if let Some(sync) = &mut sync {
+            sync.fill(0.0);
+        }
         let length = self.len();
         if !self.repeat && self.position == length {
             output.fill(0.0);
             return true;
         }
-        for sample in output {
+        for (index, sample) in output.iter_mut().enumerate() {
             if self.position == length && self.repeat {
                 self.position = 0;
             }
@@ -184,7 +201,15 @@ impl Playback {
                 *sample = match &self.content {
                     PlaybackContent::Pcm(samples) => samples[self.position],
                     PlaybackContent::Nbtv { clip, sample_rate } => {
-                        clip.sample(self.position, *sample_rate)
+                        let picture = clip.sample(self.position, *sample_rate);
+                        if separate {
+                            if let Some(sync) = &mut sync {
+                                sync[index] = nbtv::sync_sample(self.position, *sample_rate);
+                            }
+                            picture.max(0.0)
+                        } else {
+                            picture
+                        }
                     }
                 };
                 self.position += 1;
