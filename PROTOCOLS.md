@@ -12,7 +12,7 @@ Every mode transmits a still image, not a conventional moving-video stream.
 For moving video, the separate `nbtv-encoder` and `nbtv-decoder` applications
 implement Classic and custom Separate sync NBTV. These are not SSTV modes.
 See [NBTV protocols](#nbtv-protocols) below for their signal formats and
-[NBTV operation](README.md#nbtv-moving-video-and-still-images) for application usage.
+[NBTV operation](DOCUMENTATION.md#nbtv-moving-video-and-still-images) for application usage.
 
 ## Common SSTV signal format
 
@@ -443,7 +443,7 @@ is intended for controlled JACK effects experiments with these applications.
   and [row-pair chroma averaging](https://github.com/unexcellent/sstv/blob/v0.3.1/src/encode/rgb_lines.rs).
 - The upstream tables cite JL Barber (N7CXI), *Proposal for SSTV Mode
   Specifications*, Dayton SSTV forum, 20 May 2000.
-- [Application operation and JACK routing](README.md), including transport,
+- [Application operation and JACK routing](DOCUMENTATION.md), including transport,
   repeat, and headless behavior.
 - [NBTV Association club standard](https://www.nbtv.org.uk/standards.htm):
   scan geometry, missing-pulse synchronization, levels, and bandwidth.
